@@ -184,6 +184,22 @@ void setup() {
   Serial.begin(115200);
   delay(50);
 
+  // --- Motor safety (NO motion / NO holding torque during bring-up) ---
+  // If your TMC2209 EN pin is wired to GPIO2 (recommended), this will disable the driver.
+  // If EN is hard-tied to GND, firmware cannot disable the driver — you must rewire EN.
+  pinMode(PIN_TMC_STEP, OUTPUT);
+  digitalWrite(PIN_TMC_STEP, LOW);
+
+  pinMode(PIN_TMC_DIR, OUTPUT);
+  digitalWrite(PIN_TMC_DIR, LOW);
+
+  pinMode(PIN_TMC_EN, OUTPUT);
+  digitalWrite(PIN_TMC_EN, HIGH); // Active-LOW enable => HIGH disables
+
+  // Keep UART pins quiet during bring-up
+  pinMode(PIN_TMC_UART_TX, INPUT);
+  pinMode(PIN_TMC_UART_RX, INPUT);
+
   // --- Power + backlight pins (must be set before lcd.init on this board) ---
   pinMode(PIN_TFT_POWER, OUTPUT);
   digitalWrite(PIN_TFT_POWER, HIGH);
