@@ -33,3 +33,10 @@ static constexpr uint8_t LASTMODE_MAX = 4;
 
 // UI toast duration
 static constexpr uint32_t SAVED_TOAST_MS = 800;
+
+// ---------------------------
+// AS5600 / I2C
+// ---------------------------
+static constexpr uint32_t AS5600_PROBE_MS = 250;   // how often to re-check presence
+static constexpr int32_t  AS5600_WRAP_THRESH = 2048; // > half-scale => wrap
+static constexpr float    AS5600_TICKS_FILTER_ALPHA = 0.12f; // EMA strength (0..1)

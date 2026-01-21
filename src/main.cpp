@@ -132,7 +132,7 @@ class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
       auto cfg = _light.config();
       cfg.pin_bl      = PIN_TFT_BL;
       cfg.invert      = false;
-      cfg.freq        = 50000;   // was 12000; 50kHz reduces visible banding
+      cfg.freq        = 50000;
       cfg.pwm_channel = 7;
       _light.config(cfg);
       _panel.setLight(&_light);
@@ -243,7 +243,7 @@ struct RotaryEncoder {
 };
 
 // ------------------------------------------------------------
-// AS5600 helpers (still displayed)
+// AS5600 helpers + multi-turn tracking
 // ------------------------------------------------------------
 static constexpr uint8_t AS5600_ADDR = 0x36;
 
@@ -253,6 +253,7 @@ static bool i2cDevicePresent(uint8_t addr) {
 }
 
 static bool as5600ReadRawAngle(uint16_t &rawOut) {
+  // RAW ANGLE: 0x0C (MSB), 0x0D (LSB)
   Wire.beginTransmission(AS5600_ADDR);
   Wire.write(0x0C);
   if (Wire.endTransmission(false) != 0) return false;
@@ -270,6 +271,91 @@ static float rawToDegrees(uint16_t raw) {
   return (raw * 360.0f) / 4096.0f;
 }
 
+static float ticksToDegrees(float ticks) {
+  return (ticks * 360.0f) / 4096.0f;
+}
+
+static float wrapTicksTo0_4096(float ticks) {
+  // Convert a continuous tick value to [0, 4096)
+  float wrapped = fmodf(ticks, 4096.0f);
+  if (wrapped < 0) wrapped += 4096.0f;
+  return wrapped;
+}
+
+struct AS5600State {
+  bool present = false;
+  bool readOk  = false;
+
+  bool init    = false;
+  uint16_t raw = 0;
+
+  int32_t turns = 0;       // number of wraps
+  int32_t ticks = 0;       // multi-turn ticks = turns*4096 + raw
+  float   ticksF = 0.0f;   // filtered multi-turn ticks
+
+  float   deg = 0.0f;      // 0..360 from raw
+  float   degF = 0.0f;     // filtered within-rev degrees
+  float   pct = 0.0f;      // 0..100 from raw
+};
+
+static AS5600State g_as;
+static uint16_t g_asLastRaw = 0;
+static uint32_t g_lastProbeMs = 0;
+
+static void updateAS5600() {
+  const uint32_t now = millis();
+
+  // Probe presence on an interval (keeps "missing" behavior stable)
+  if (now - g_lastProbeMs >= AS5600_PROBE_MS) {
+    g_lastProbeMs = now;
+    g_as.present = i2cDevicePresent(AS5600_ADDR);
+    if (!g_as.present) {
+      g_as.readOk = false;
+      g_as.init = false;
+    }
+  }
+
+  if (!g_as.present) return;
+
+  uint16_t raw = 0;
+  const bool ok = as5600ReadRawAngle(raw);
+  g_as.readOk = ok;
+  if (!ok) return;
+
+  g_as.raw = raw;
+  g_as.deg = rawToDegrees(raw);
+  g_as.pct = (raw * 100.0f) / 4095.0f;
+
+  if (!g_as.init) {
+    g_as.turns = 0;
+    g_as.ticks = (int32_t)raw;
+    g_as.ticksF = (float)g_as.ticks;
+    g_asLastRaw = raw;
+    g_as.init = true;
+  } else {
+    const int32_t diff = (int32_t)raw - (int32_t)g_asLastRaw;
+
+    // Wrap detection
+    if (diff > AS5600_WRAP_THRESH) {
+      // jumped forward across 0 -> means we actually went backward across wrap
+      g_as.turns -= 1;
+    } else if (diff < -AS5600_WRAP_THRESH) {
+      // jumped backward across 4095 -> means we actually went forward across wrap
+      g_as.turns += 1;
+    }
+
+    g_asLastRaw = raw;
+    g_as.ticks = g_as.turns * 4096 + (int32_t)raw;
+
+    // Filter continuous ticks (safe across wrap)
+    g_as.ticksF = g_as.ticksF + AS5600_TICKS_FILTER_ALPHA * ((float)g_as.ticks - g_as.ticksF);
+  }
+
+  // Filtered within-rev angle from filtered ticks
+  const float wrapped = wrapTicksTo0_4096(g_as.ticksF);
+  g_as.degF = (wrapped * 360.0f) / 4096.0f;
+}
+
 // ------------------------------------------------------------
 // UI
 // ------------------------------------------------------------
@@ -283,14 +369,11 @@ static void flashTestPattern() {
 static void drawStaticLayout() {
   lcd.fillScreen(lcd.color888(0, 0, 0));
 
-  // Removed: title line + "Milestone 3..." line (per request)
-  // Keep only one compact instruction line to maximize vertical space.
   lcd.setTextSize(1);
   lcd.setTextColor(lcd.color888(255, 255, 255));
   lcd.setCursor(6, 4);
   lcd.print("SW: test  |  B: invert  |  ENC: mode  |  A: save");
 
-  // Divider line
   lcd.drawFastHLine(0, 18, lcd.width(), lcd.color888(60, 60, 60));
 }
 
@@ -298,11 +381,10 @@ static void drawLiveStatus(
   const Settings& s,
   bool btnA, bool btnB, bool encSw,
   int32_t encPos, int8_t encDelta,
-  bool as5600Present, bool as5600ReadOk, uint16_t raw, float deg,
+  const AS5600State& as,
   uint16_t fps,
   bool showSaved
 ) {
-  // Clear live status area (below divider)
   lcd.fillRect(0, 20, lcd.width(), lcd.height() - 20, lcd.color888(0, 0, 0));
 
   lcd.setTextSize(2);
@@ -329,22 +411,37 @@ static void drawLiveStatus(
   lcd.setCursor(8, 116);
   lcd.printf("bootCount:   %lu", (unsigned long)s.bootCount);
 
+  // ----- AS5600 block (Milestone 4) -----
   lcd.setCursor(8, 134);
-  if (!as5600Present) {
+  if (!as.present) {
     lcd.print("AS5600: NOT FOUND @0x36");
-  } else if (!as5600ReadOk) {
+  } else if (!as.readOk) {
     lcd.print("AS5600: present, read FAIL");
   } else {
-    lcd.printf("AS5600: raw=0x%03X  deg=%0.1f", raw, deg);
+    lcd.printf("AS5600 raw:%4u  %6.2fdeg  %5.1f%%", as.raw, as.deg, as.pct);
   }
 
-  lcd.setCursor(8, 150);
+  lcd.setCursor(8, 148);
+  if (as.present && as.readOk) {
+    lcd.printf("ticks:%ld  fticks:%0.1f", (long)as.ticks, (double)as.ticksF);
+  } else {
+    lcd.print("ticks: --");
+  }
+
+  lcd.setCursor(8, 162);
+  if (as.present && as.readOk) {
+    lcd.printf("degF:%6.2f  turns:%ld", (double)as.degF, (long)as.turns);
+  } else {
+    lcd.print("degF: --");
+  }
+
+  lcd.setCursor(8, 180);
   lcd.printf("FPS: %u", (unsigned)fps);
 
   if (showSaved) {
     lcd.setTextSize(2);
     lcd.setTextColor(lcd.color888(0, 255, 0));
-    lcd.setCursor(8, 170);
+    lcd.setCursor(8, 204);
     lcd.print("SAVED");
   }
 }
@@ -398,6 +495,12 @@ void setup() {
   // --- I2C ---
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
+
+  // Prime AS5600 probe immediately
+  g_lastProbeMs = 0;
+  g_as.present = false;
+  g_as.readOk = false;
+  g_as.init = false;
 
   // --- Settings load + boot counter ---
   settingsLoad(g_settings);
@@ -470,15 +573,8 @@ void loop() {
     markSavedToast();
   }
 
-  // AS5600
-  const bool as5600_present = i2cDevicePresent(AS5600_ADDR);
-  uint16_t raw = 0;
-  float deg = 0.0f;
-  bool as5600_read_ok = false;
-  if (as5600_present) {
-    as5600_read_ok = as5600ReadRawAngle(raw);
-    if (as5600_read_ok) deg = rawToDegrees(raw);
-  }
+  // ----- AS5600 update (Milestone 4) -----
+  updateAS5600();
 
   // FPS
   g_frameCount++;
@@ -498,7 +594,7 @@ void loop() {
       g_settings,
       a, b, sw,
       g_enc.detentPos, g_enc.detentDelta,
-      as5600_present, as5600_read_ok, raw, deg,
+      g_as,
       g_fps,
       showSaved
     );
