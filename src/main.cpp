@@ -1,77 +1,14 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LovyanGFX.hpp>
-#include <Preferences.h>
 
-// Pins: single source of truth.
 #include "BoardPins.h"
-
-// Config constants: single source of truth.
 #include "Config.h"
-
-// Persisted settings
 #include "Settings.h"
+#include "Display.h"
 
 // ------------------------------------------------------------
-// Settings persistence implementation (Milestone 3)
-// NOTE: Implemented here to guarantee the linker sees the definitions.
-// Later, we can move this into src/Settings.cpp once the file exists.
-// ------------------------------------------------------------
-static Preferences g_prefs;
-
-void settingsSetDefaults(Settings& s) {
-  s.testingMode = false;
-  s.invertDir   = false;
-  s.lastMode    = 0;
-  s.bootCount   = 0;
-}
-
-bool settingsLoad(Settings& s) {
-  settingsSetDefaults(s);
-
-  if (!g_prefs.begin(PREFS_NAMESPACE, false)) {
-    return false;
-  }
-
-  const uint16_t ver = g_prefs.getUShort(KEY_VER, 0);
-  if (ver != SETTINGS_VERSION) {
-    // Version mismatch or first boot: write defaults.
-    settingsSetDefaults(s);
-    g_prefs.putUShort(KEY_VER, SETTINGS_VERSION);
-    g_prefs.putBool(KEY_TEST, s.testingMode);
-    g_prefs.putBool(KEY_INVERT, s.invertDir);
-    g_prefs.putUChar(KEY_LASTMODE, s.lastMode);
-    g_prefs.putUInt(KEY_BOOTCOUNT, s.bootCount);
-    g_prefs.end();
-    return true;
-  }
-
-  s.testingMode = g_prefs.getBool(KEY_TEST, s.testingMode);
-  s.invertDir   = g_prefs.getBool(KEY_INVERT, s.invertDir);
-  s.lastMode    = g_prefs.getUChar(KEY_LASTMODE, s.lastMode);
-  s.bootCount   = g_prefs.getUInt(KEY_BOOTCOUNT, s.bootCount);
-
-  g_prefs.end();
-  return true;
-}
-
-bool settingsSave(const Settings& s) {
-  if (!g_prefs.begin(PREFS_NAMESPACE, false)) {
-    return false;
-  }
-
-  g_prefs.putUShort(KEY_VER, SETTINGS_VERSION);
-  g_prefs.putBool(KEY_TEST, s.testingMode);
-  g_prefs.putBool(KEY_INVERT, s.invertDir);
-  g_prefs.putUChar(KEY_LASTMODE, s.lastMode);
-  g_prefs.putUInt(KEY_BOOTCOUNT, s.bootCount);
-
-  g_prefs.end();
-  return true;
-}
-
-// ------------------------------------------------------------
-// LovyanGFX display driver for LilyGO T-Display S3
+// LovyanGFX display driver for LilyGO T-Display S3 (I80 8-bit)
 // ------------------------------------------------------------
 class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
  public:
@@ -127,12 +64,11 @@ class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
     }
 
     // ---- Backlight PWM ----
-    // Fix rolling "dark band" by raising PWM frequency well above visible range.
     {
       auto cfg = _light.config();
       cfg.pin_bl      = PIN_TFT_BL;
       cfg.invert      = false;
-      cfg.freq        = 50000;
+      cfg.freq        = 24000;
       cfg.pwm_channel = 7;
       _light.config(cfg);
       _panel.setLight(&_light);
@@ -145,7 +81,7 @@ class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
 static LGFX_TDisplayS3 lcd;
 
 // ------------------------------------------------------------
-// Debounced digital input helper
+// Debounced inputs
 // ------------------------------------------------------------
 struct DebouncedInput {
   int pin = -1;
@@ -180,15 +116,11 @@ struct DebouncedInput {
   bool pressedActiveLow() const { return stable == LOW; }
 };
 
-// ------------------------------------------------------------
-// Rotary encoder (polling) using Gray-code transition table
-// ------------------------------------------------------------
 struct RotaryEncoder {
   int pinA = -1;
   int pinB = -1;
   uint8_t prevAB = 0;
   int8_t accum = 0;
-  int32_t detentPos = 0;
   int8_t detentDelta = 0;
 
   void begin(int gpioA, int gpioB) {
@@ -202,7 +134,6 @@ struct RotaryEncoder {
     prevAB = (a << 1) | b;
 
     accum = 0;
-    detentPos = 0;
     detentDelta = 0;
   }
 
@@ -232,18 +163,16 @@ struct RotaryEncoder {
 
     if (accum >= (int8_t)ENC_COUNTS_PER_DETENT) {
       accum = 0;
-      detentPos++;
       detentDelta = 1;
     } else if (accum <= -(int8_t)ENC_COUNTS_PER_DETENT) {
       accum = 0;
-      detentPos--;
       detentDelta = -1;
     }
   }
 };
 
 // ------------------------------------------------------------
-// AS5600 helpers + multi-turn tracking
+// AS5600 (I2C)
 // ------------------------------------------------------------
 static constexpr uint8_t AS5600_ADDR = 0x36;
 
@@ -253,9 +182,8 @@ static bool i2cDevicePresent(uint8_t addr) {
 }
 
 static bool as5600ReadRawAngle(uint16_t &rawOut) {
-  // RAW ANGLE: 0x0C (MSB), 0x0D (LSB)
   Wire.beginTransmission(AS5600_ADDR);
-  Wire.write(0x0C);
+  Wire.write(0x0C); // RAW_ANGLE high byte
   if (Wire.endTransmission(false) != 0) return false;
 
   const uint8_t n = Wire.requestFrom((int)AS5600_ADDR, 2);
@@ -271,209 +199,227 @@ static float rawToDegrees(uint16_t raw) {
   return (raw * 360.0f) / 4096.0f;
 }
 
-static float ticksToDegrees(float ticks) {
-  return (ticks * 360.0f) / 4096.0f;
-}
-
-static float wrapTicksTo0_4096(float ticks) {
-  // Convert a continuous tick value to [0, 4096)
-  float wrapped = fmodf(ticks, 4096.0f);
-  if (wrapped < 0) wrapped += 4096.0f;
-  return wrapped;
-}
-
-struct AS5600State {
-  bool present = false;
-  bool readOk  = false;
-
-  bool init    = false;
-  uint16_t raw = 0;
-
-  int32_t turns = 0;       // number of wraps
-  int32_t ticks = 0;       // multi-turn ticks = turns*4096 + raw
-  float   ticksF = 0.0f;   // filtered multi-turn ticks
-
-  float   deg = 0.0f;      // 0..360 from raw
-  float   degF = 0.0f;     // filtered within-rev degrees
-  float   pct = 0.0f;      // 0..100 from raw
-};
-
-static AS5600State g_as;
-static uint16_t g_asLastRaw = 0;
-static uint32_t g_lastProbeMs = 0;
-
-static void updateAS5600() {
-  const uint32_t now = millis();
-
-  // Probe presence on an interval (keeps "missing" behavior stable)
-  if (now - g_lastProbeMs >= AS5600_PROBE_MS) {
-    g_lastProbeMs = now;
-    g_as.present = i2cDevicePresent(AS5600_ADDR);
-    if (!g_as.present) {
-      g_as.readOk = false;
-      g_as.init = false;
-    }
-  }
-
-  if (!g_as.present) return;
-
-  uint16_t raw = 0;
-  const bool ok = as5600ReadRawAngle(raw);
-  g_as.readOk = ok;
-  if (!ok) return;
-
-  g_as.raw = raw;
-  g_as.deg = rawToDegrees(raw);
-  g_as.pct = (raw * 100.0f) / 4095.0f;
-
-  if (!g_as.init) {
-    g_as.turns = 0;
-    g_as.ticks = (int32_t)raw;
-    g_as.ticksF = (float)g_as.ticks;
-    g_asLastRaw = raw;
-    g_as.init = true;
-  } else {
-    const int32_t diff = (int32_t)raw - (int32_t)g_asLastRaw;
-
-    // Wrap detection
-    if (diff > AS5600_WRAP_THRESH) {
-      // jumped forward across 0 -> means we actually went backward across wrap
-      g_as.turns -= 1;
-    } else if (diff < -AS5600_WRAP_THRESH) {
-      // jumped backward across 4095 -> means we actually went forward across wrap
-      g_as.turns += 1;
-    }
-
-    g_asLastRaw = raw;
-    g_as.ticks = g_as.turns * 4096 + (int32_t)raw;
-
-    // Filter continuous ticks (safe across wrap)
-    g_as.ticksF = g_as.ticksF + AS5600_TICKS_FILTER_ALPHA * ((float)g_as.ticks - g_as.ticksF);
-  }
-
-  // Filtered within-rev angle from filtered ticks
-  const float wrapped = wrapTicksTo0_4096(g_as.ticksF);
-  g_as.degF = (wrapped * 360.0f) / 4096.0f;
-}
-
-// ------------------------------------------------------------
-// UI
-// ------------------------------------------------------------
-static void flashTestPattern() {
-  lcd.fillScreen(lcd.color888(255, 0, 0)); delay(120);
-  lcd.fillScreen(lcd.color888(0, 255, 0)); delay(120);
-  lcd.fillScreen(lcd.color888(0, 0, 255)); delay(120);
-  lcd.fillScreen(lcd.color888(0, 0, 0));   delay(120);
-}
-
-static void drawStaticLayout() {
-  lcd.fillScreen(lcd.color888(0, 0, 0));
-
-  lcd.setTextSize(1);
-  lcd.setTextColor(lcd.color888(255, 255, 255));
-  lcd.setCursor(6, 4);
-  lcd.print("SW: test  |  B: invert  |  ENC: mode  |  A: save");
-
-  lcd.drawFastHLine(0, 18, lcd.width(), lcd.color888(60, 60, 60));
-}
-
-static void drawLiveStatus(
-  const Settings& s,
-  bool btnA, bool btnB, bool encSw,
-  int32_t encPos, int8_t encDelta,
-  const AS5600State& as,
-  uint16_t fps,
-  bool showSaved
-) {
-  lcd.fillRect(0, 20, lcd.width(), lcd.height() - 20, lcd.color888(0, 0, 0));
-
-  lcd.setTextSize(2);
-  lcd.setCursor(8, 24);
-  lcd.setTextColor(lcd.color888(255, 255, 0));
-  lcd.printf("A:%s  B:%s  SW:%s", btnA ? "ON" : "--", btnB ? "ON" : "--", encSw ? "ON" : "--");
-
-  lcd.setCursor(8, 48);
-  lcd.setTextColor(lcd.color888(0, 255, 255));
-  lcd.printf("ENC:%ld  d:%d", (long)encPos, (int)encDelta);
-
-  lcd.setTextSize(1);
-  lcd.setTextColor(lcd.color888(180, 180, 180));
-
-  lcd.setCursor(8, 74);
-  lcd.printf("testingMode: %s", s.testingMode ? "true" : "false");
-
-  lcd.setCursor(8, 88);
-  lcd.printf("invertDir:   %s", s.invertDir ? "true" : "false");
-
-  lcd.setCursor(8, 102);
-  lcd.printf("lastMode:    %u", (unsigned)s.lastMode);
-
-  lcd.setCursor(8, 116);
-  lcd.printf("bootCount:   %lu", (unsigned long)s.bootCount);
-
-  // ----- AS5600 block (Milestone 4) -----
-  lcd.setCursor(8, 134);
-  if (!as.present) {
-    lcd.print("AS5600: NOT FOUND @0x36");
-  } else if (!as.readOk) {
-    lcd.print("AS5600: present, read FAIL");
-  } else {
-    lcd.printf("AS5600 raw:%4u  %6.2fdeg  %5.1f%%", as.raw, as.deg, as.pct);
-  }
-
-  lcd.setCursor(8, 148);
-  if (as.present && as.readOk) {
-    lcd.printf("ticks:%ld  fticks:%0.1f", (long)as.ticks, (double)as.ticksF);
-  } else {
-    lcd.print("ticks: --");
-  }
-
-  lcd.setCursor(8, 162);
-  if (as.present && as.readOk) {
-    lcd.printf("degF:%6.2f  turns:%ld", (double)as.degF, (long)as.turns);
-  } else {
-    lcd.print("degF: --");
-  }
-
-  lcd.setCursor(8, 180);
-  lcd.printf("FPS: %u", (unsigned)fps);
-
-  if (showSaved) {
-    lcd.setTextSize(2);
-    lcd.setTextColor(lcd.color888(0, 255, 0));
-    lcd.setCursor(8, 204);
-    lcd.print("SAVED");
-  }
-}
-
 // ------------------------------------------------------------
 // Globals
 // ------------------------------------------------------------
-static DebouncedInput g_btnA;
-static DebouncedInput g_btnB;
-static DebouncedInput g_encSw;
+static DebouncedInput g_btnA, g_btnB, g_encSw;
 static RotaryEncoder  g_enc;
 
 static Settings g_settings;
+static DisplayUI g_display;
+static UiState g_ui;
 
 static uint16_t g_fps = 0;
 static uint16_t g_frameCount = 0;
 static uint32_t g_lastFpsMs = 0;
 
-static uint32_t g_savedToastUntil = 0;
+// Focus navigation ordering (HTML)
+// Helper functions for new UI model
+static const char* kModeNames[] = {"Single", "Bounce", "Timelapse", "Last"};
+static constexpr uint8_t kModeCount = (uint8_t)(sizeof(kModeNames) / sizeof(kModeNames[0]));
 
-static void markSavedToast() {
-  g_savedToastUntil = millis() + SAVED_TOAST_MS;
+static void uiSyncModeName() {
+  const uint8_t idx = (uint8_t)(g_settings.lastMode % kModeCount);
+  g_ui.modeName = kModeNames[idx];
 }
 
-static void clampLastMode(Settings& s) {
-  if (s.lastMode < LASTMODE_MIN) s.lastMode = LASTMODE_MIN;
-  if (s.lastMode > LASTMODE_MAX) s.lastMode = LASTMODE_MAX;
+static bool uiAllMarkersSet() {
+  for (int i = 0; i < g_ui.markerCount; i++) {
+    if (!g_ui.markers[i].set) return false;
+  }
+  return true;
+}
+
+static int uiFocusedMarkerIndex() {
+  const int f = (int)g_ui.mainFocus;
+  const int base = (int)MainFocus::MARKER0;
+  const int idx = f - base;
+  if (idx >= 0 && idx < g_ui.markerCount) return idx;
+  return -1;
+}
+
+static MainFocus markerFocusFromIndex(int idx) {
+  const int base = (int)MainFocus::MARKER0;
+  const int v = base + idx;
+  return (MainFocus)v;
+}
+
+static void mainFocusStep(int dir) {
+  // Build the cyclic order: Settings -> Markers (0..N-1) -> Next -> Mode
+  const int n = g_ui.markerCount;
+  const int total = 1 + n + 2;
+
+  int idx = 0;
+
+  // Determine current index
+  if (g_ui.mainFocus == MainFocus::SETTINGS) {
+    idx = 0;
+  } else if (g_ui.mainFocus == MainFocus::NEXT) {
+    idx = 1 + n;
+  } else if (g_ui.mainFocus == MainFocus::MODE) {
+    idx = 1 + n + 1;
+  } else {
+    const int mi = uiFocusedMarkerIndex();
+    idx = (mi >= 0) ? (1 + mi) : 0;
+  }
+
+  // Step with wrap
+  idx += dir;
+  if (idx < 0) idx = total - 1;
+  if (idx >= total) idx = 0;
+
+  // Apply new focus
+  if (idx == 0) {
+    g_ui.mainFocus = MainFocus::SETTINGS;
+  } else if (idx >= 1 && idx <= n) {
+    g_ui.mainFocus = markerFocusFromIndex(idx - 1);
+  } else if (idx == 1 + n) {
+    // Next can be disabled/unselectable until all markers set
+    g_ui.allMarkersSet = uiAllMarkersSet();
+    if (!g_ui.allMarkersSet) {
+      // Skip over Next
+      idx += dir;
+      if (idx < 0) idx = total - 1;
+      if (idx >= total) idx = 0;
+      if (idx == 0) g_ui.mainFocus = MainFocus::SETTINGS;
+      else if (idx >= 1 && idx <= n) g_ui.mainFocus = markerFocusFromIndex(idx - 1);
+      else g_ui.mainFocus = MainFocus::MODE;
+    } else {
+      g_ui.mainFocus = MainFocus::NEXT;
+    }
+  } else {
+    g_ui.mainFocus = MainFocus::MODE;
+  }
+}
+
+// Marker edit presets for SET_POS screen
+static int g_editMarker = -1;
+static int g_editPreset = 0;
+
+static const MarkerState kMarkerPresets[] = {
+  {false,false,false,false}, // incomplete
+  {true,false,false,false},  // set
+  {true,true,false,false},   // ease-in
+  {true,false,true,false},   // ease-out
+  {true,true,true,false},    // ease-in-out
+  {true,false,false,true},   // pause
+  {true,true,false,true},    // ease-in + pause
+  {true,false,true,true},    // pause + ease-out
+  {true,true,true,true},     // ease-in + pause + ease-out
+};
+static constexpr int kMarkerPresetCount = (int)(sizeof(kMarkerPresets)/sizeof(kMarkerPresets[0]));
+
+static void settingsFocusStep(int dir) {
+  static const SettingsFocus order[] = {
+    SettingsFocus::BACK, SettingsFocus::TESTING_MODE, SettingsFocus::INVERT_DIR
+  };
+
+  int idx = 0;
+  for (int i = 0; i < (int)(sizeof(order)/sizeof(order[0])); i++) {
+    if (order[i] == g_ui.settingsFocus) { idx = i; break; }
+  }
+  idx += dir;
+  if (idx < 0) idx = (int)(sizeof(order)/sizeof(order[0])) - 1;
+  if (idx >= (int)(sizeof(order)/sizeof(order[0]))) idx = 0;
+  g_ui.settingsFocus = order[idx];
+}
+
+static void handleEnter() {
+  switch (g_ui.screen) {
+    case UiScreen::MAIN:
+      switch (g_ui.mainFocus) {
+        case MainFocus::SETTINGS:
+          g_ui.screen = UiScreen::SETTINGS;
+          g_ui.settingsFocus = SettingsFocus::TESTING_MODE;
+          break;
+
+        case MainFocus::NEXT:
+          g_ui.allMarkersSet = uiAllMarkersSet();
+          if (!g_ui.allMarkersSet) {
+            g_ui.screen = UiScreen::POPUP;
+            g_ui.popup = PopupKind::NEED_ALL_MARKERS;
+            g_ui.popupYesSelected = false;
+          } else {
+            g_ui.screen = UiScreen::WIZARD;
+          }
+          break;
+
+        case MainFocus::MODE:
+          g_settings.lastMode = (uint8_t)((g_settings.lastMode + 1) % kModeCount);
+          settingsSave(g_settings);
+          uiSyncModeName();
+          break;
+
+        default: {
+          // Any marker focus -> SET_POS (marker editing)
+          const int mi = uiFocusedMarkerIndex();
+          if (mi >= 0) {
+            g_ui.screen = UiScreen::SET_POS;
+            g_editMarker = mi;
+            // Find closest preset index to current marker state
+            int found = 0;
+            for (int p = 0; p < kMarkerPresetCount; p++) {
+              const MarkerState& s = kMarkerPresets[p];
+              if (s.set==g_ui.markers[mi].set && s.easeIn==g_ui.markers[mi].easeIn && s.easeOut==g_ui.markers[mi].easeOut && s.pause==g_ui.markers[mi].pause) {
+                found = p;
+                break;
+              }
+            }
+            g_editPreset = found;
+          }
+        } break;
+      }
+      break;
+
+    case UiScreen::SETTINGS:
+      if (g_ui.settingsFocus == SettingsFocus::TESTING_MODE) {
+        g_settings.testingMode = !g_settings.testingMode;
+        settingsSave(g_settings);
+      } else if (g_ui.settingsFocus == SettingsFocus::INVERT_DIR) {
+        g_settings.invertDir = !g_settings.invertDir;
+        settingsSave(g_settings);
+      } else if (g_ui.settingsFocus == SettingsFocus::BACK) {
+        g_ui.screen = UiScreen::MAIN;
+      }
+      break;
+
+    case UiScreen::SET_POS:
+      // Confirm current preset for the marker and return to MAIN
+      if (g_editMarker >= 0 && g_editMarker < g_ui.markerCount) {
+        g_ui.markers[g_editMarker] = kMarkerPresets[g_editPreset];
+      }
+      g_ui.allMarkersSet = uiAllMarkersSet();
+      g_ui.screen = UiScreen::MAIN;
+      break;
+
+    case UiScreen::WIZARD:
+      g_ui.screen = UiScreen::RUN;
+      break;
+
+    case UiScreen::RUN:
+      g_ui.screen = UiScreen::POPUP;
+      g_ui.popup = PopupKind::CONFIRM_CANCEL;
+      g_ui.popupYesSelected = false; // default "No"
+      break;
+
+    case UiScreen::POPUP:
+      if (g_ui.popup == PopupKind::CONFIRM_CANCEL) {
+        if (g_ui.popupYesSelected) {
+          g_ui.screen = UiScreen::MAIN;
+          g_ui.popup = PopupKind::NONE;
+        } else {
+          g_ui.screen = UiScreen::RUN;
+          g_ui.popup = PopupKind::NONE;
+        }
+      }
+      break;
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(50);
+  Serial.println("\n[SlidePilot] boot");
 
   // --- Motor safety: keep driver disabled + prevent floating STEP/DIR ---
   pinMode(PIN_TMC_STEP, OUTPUT); digitalWrite(PIN_TMC_STEP, LOW);
@@ -496,25 +442,32 @@ void setup() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
 
-  // Prime AS5600 probe immediately
-  g_lastProbeMs = 0;
-  g_as.present = false;
-  g_as.readOk = false;
-  g_as.init = false;
-
-  // --- Settings load + boot counter ---
+  // --- Settings ---
   settingsLoad(g_settings);
-  g_settings.bootCount++;
-  settingsSave(g_settings);
-  markSavedToast();
+  uiSyncModeName();
 
   // --- LCD ---
   lcd.init();
   lcd.setRotation(1);
   lcd.setBrightness(255);
 
-  flashTestPattern();
-  drawStaticLayout();
+  // --- Display UI ---
+  const bool spriteOk = g_display.begin(&lcd);
+  Serial.printf("[SlidePilot] DisplayUI begin: spriteOk=%s\n", spriteOk ? "true" : "false");
+
+  // Init UI state
+  g_ui.screen = UiScreen::MAIN;
+  // start focus on first marker
+  g_ui.markerCount = 2;
+  for (int i = 0; i < UiState::kMaxMarkers; i++) {
+    g_ui.markers[i] = MarkerState{};
+  }
+
+  g_ui.mainFocus = MainFocus::MARKER0;
+
+  g_ui.settings = g_settings;
+
+  g_ui.allMarkersSet = uiAllMarkersSet();
 
   g_lastFpsMs = millis();
 }
@@ -529,54 +482,55 @@ void loop() {
   const bool b = g_btnB.pressedActiveLow();
   const bool sw = g_encSw.pressedActiveLow();
 
-  // Edge detection
-  static bool prevA = false, prevB = false, prevSW = false;
-  const bool aPress = (a && !prevA);
-  const bool bPress = (b && !prevB);
+  static bool prevA=false, prevB=false, prevSW=false;
+  const bool aPress  = (a && !prevA);
+  const bool bPress  = (b && !prevB);
   const bool swPress = (sw && !prevSW);
-  prevA = a; prevB = b; prevSW = sw;
+  prevA=a; prevB=b; prevSW=sw;
 
-  bool changed = false;
-
-  // Encoder changes lastMode
   if (g_enc.detentDelta != 0) {
-    int newMode = (int)g_settings.lastMode + (int)g_enc.detentDelta;
-    if (newMode < (int)LASTMODE_MIN) newMode = LASTMODE_MIN;
-    if (newMode > (int)LASTMODE_MAX) newMode = LASTMODE_MAX;
-    if ((uint8_t)newMode != g_settings.lastMode) {
-      g_settings.lastMode = (uint8_t)newMode;
-      changed = true;
+    if (g_ui.screen == UiScreen::MAIN) {
+      mainFocusStep(g_enc.detentDelta);
+    } else if (g_ui.screen == UiScreen::SETTINGS) {
+      settingsFocusStep(g_enc.detentDelta);
+    } else if (g_ui.screen == UiScreen::POPUP) {
+      g_ui.popupYesSelected = !g_ui.popupYesSelected;
+    } else if (g_ui.screen == UiScreen::SET_POS) {
+      g_editPreset += g_enc.detentDelta;
+      if (g_editPreset < 0) g_editPreset = kMarkerPresetCount - 1;
+      if (g_editPreset >= kMarkerPresetCount) g_editPreset = 0;
+      if (g_editMarker >= 0 && g_editMarker < g_ui.markerCount) {
+        g_ui.markers[g_editMarker] = kMarkerPresets[g_editPreset];
+      }
     }
   }
 
-  // SW toggles testingMode
-  if (swPress) {
-    g_settings.testingMode = !g_settings.testingMode;
-    changed = true;
-  }
+  if (swPress) handleEnter();
 
-  // B toggles invertDir
-  if (bPress) {
-    g_settings.invertDir = !g_settings.invertDir;
-    changed = true;
-  }
-
-  // A forces save
   if (aPress) {
-    settingsSave(g_settings);
-    markSavedToast();
+    if (g_ui.screen == UiScreen::SETTINGS ||
+        g_ui.screen == UiScreen::SET_POS ||
+        g_ui.screen == UiScreen::WIZARD) {
+      g_ui.screen = UiScreen::MAIN;
+    } else if (g_ui.screen == UiScreen::RUN) {
+      g_ui.screen = UiScreen::POPUP;
+      g_ui.popup = PopupKind::CONFIRM_CANCEL;
+      g_ui.popupYesSelected = false;
+    } else if (g_ui.screen == UiScreen::POPUP) {
+      g_ui.screen = UiScreen::RUN;
+      g_ui.popup = PopupKind::NONE;
+    }
   }
 
-  if (changed) {
-    clampLastMode(g_settings);
-    settingsSave(g_settings);
-    markSavedToast();
+  (void)b; // unused right now
+
+  As5600View av;
+  av.present = i2cDevicePresent(AS5600_ADDR);
+  if (av.present) {
+    av.readOk = as5600ReadRawAngle(av.raw);
+    if (av.readOk) av.deg = rawToDegrees(av.raw);
   }
 
-  // ----- AS5600 update (Milestone 4) -----
-  updateAS5600();
-
-  // FPS
   g_frameCount++;
   const uint32_t now = millis();
   if (now - g_lastFpsMs >= 1000) {
@@ -585,19 +539,17 @@ void loop() {
     g_lastFpsMs = now;
   }
 
-  // UI refresh
+  g_ui.settings = g_settings;
+  uiSyncModeName();
+  g_ui.allMarkersSet = uiAllMarkersSet();
+  g_ui.as5600 = av;
+  g_ui.fps = g_fps;
+  g_ui.btnA = a; g_ui.btnB = b; g_ui.encSw = sw;
+
   static uint32_t lastUiMs = 0;
   if (now - lastUiMs >= UI_UPDATE_MS) {
     lastUiMs = now;
-    const bool showSaved = (now < g_savedToastUntil);
-    drawLiveStatus(
-      g_settings,
-      a, b, sw,
-      g_enc.detentPos, g_enc.detentDelta,
-      g_as,
-      g_fps,
-      showSaved
-    );
+    g_display.render(g_ui);
   }
 
   delay(INPUT_POLL_DELAY_MS);
