@@ -1,12 +1,41 @@
 #pragma once
 
-// LilyGO T-Display S3 (AMOLED-less, ST7789 170x320) common pins
-// If your board is wired differently, change these.
+// LilyGO T-Display S3 (ESP32-S3) pin map
+// Display is ST7789 on 8-bit parallel bus (NOT SPI)
 
-// Display power / backlight
 static constexpr int PIN_TFT_POWER = 15;   // set HIGH to power TFT
-static constexpr int PIN_TFT_BL    = 38;   // backlight (HIGH=on)
+static constexpr int PIN_TFT_BL    = 38;   // backlight (PWM, HIGH=on)
 
-// Two onboard buttons (often labeled 0 and 14 on T-Display S3)
-static constexpr int PIN_BTN_A = 0;
-static constexpr int PIN_BTN_B = 14;
+// LCD parallel bus pins (from your pinout diagram)
+static constexpr int PIN_LCD_D0 = 39;
+static constexpr int PIN_LCD_D1 = 40;
+static constexpr int PIN_LCD_D2 = 41;
+static constexpr int PIN_LCD_D3 = 42;
+static constexpr int PIN_LCD_D4 = 45;
+static constexpr int PIN_LCD_D5 = 46;
+static constexpr int PIN_LCD_D6 = 47;
+static constexpr int PIN_LCD_D7 = 48;
+
+static constexpr int PIN_LCD_WR  = 8;
+static constexpr int PIN_LCD_RD  = 9;
+static constexpr int PIN_LCD_DC  = 7;
+static constexpr int PIN_LCD_CS  = 6;
+static constexpr int PIN_LCD_RST = 5;
+
+// Onboard buttons
+static constexpr int PIN_BTN_A = 0;   // BOOT button
+static constexpr int PIN_BTN_B = 14;  // other onboard button
+
+// Your external wiring (for later bring-up)
+static constexpr int PIN_TMC_STEP = 13;
+static constexpr int PIN_TMC_DIR  = 12;
+static constexpr int PIN_TMC_EN   = 2;    // optional, active LOW
+static constexpr int PIN_TMC_UART_TX = 10; // ESP -> driver RX
+static constexpr int PIN_TMC_UART_RX = 11; // ESP <- driver TX
+
+static constexpr int PIN_I2C_SDA = 21; // AS5600 SDA
+static constexpr int PIN_I2C_SCL = 16; // AS5600 SCL
+
+static constexpr int PIN_ENC_A  = 17; // KY-040 CLK
+static constexpr int PIN_ENC_B  = 18; // KY-040 DT
+static constexpr int PIN_ENC_SW = 1;  // KY-040 SW
