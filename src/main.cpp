@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LovyanGFX.hpp>
+#include <Preferences.h>
 
 // Pins: single source of truth.
 #include "BoardPins.h"
@@ -8,10 +9,70 @@
 // Config constants: single source of truth.
 #include "Config.h"
 
+// Persisted settings
+#include "Settings.h"
+
+// ------------------------------------------------------------
+// Settings persistence implementation (Milestone 3)
+// NOTE: Implemented here to guarantee the linker sees the definitions.
+// Later, we can move this into src/Settings.cpp once the file exists.
+// ------------------------------------------------------------
+static Preferences g_prefs;
+
+void settingsSetDefaults(Settings& s) {
+  s.testingMode = false;
+  s.invertDir   = false;
+  s.lastMode    = 0;
+  s.bootCount   = 0;
+}
+
+bool settingsLoad(Settings& s) {
+  settingsSetDefaults(s);
+
+  if (!g_prefs.begin(PREFS_NAMESPACE, false)) {
+    return false;
+  }
+
+  const uint16_t ver = g_prefs.getUShort(KEY_VER, 0);
+  if (ver != SETTINGS_VERSION) {
+    // Version mismatch or first boot: write defaults.
+    settingsSetDefaults(s);
+    g_prefs.putUShort(KEY_VER, SETTINGS_VERSION);
+    g_prefs.putBool(KEY_TEST, s.testingMode);
+    g_prefs.putBool(KEY_INVERT, s.invertDir);
+    g_prefs.putUChar(KEY_LASTMODE, s.lastMode);
+    g_prefs.putUInt(KEY_BOOTCOUNT, s.bootCount);
+    g_prefs.end();
+    return true;
+  }
+
+  s.testingMode = g_prefs.getBool(KEY_TEST, s.testingMode);
+  s.invertDir   = g_prefs.getBool(KEY_INVERT, s.invertDir);
+  s.lastMode    = g_prefs.getUChar(KEY_LASTMODE, s.lastMode);
+  s.bootCount   = g_prefs.getUInt(KEY_BOOTCOUNT, s.bootCount);
+
+  g_prefs.end();
+  return true;
+}
+
+bool settingsSave(const Settings& s) {
+  if (!g_prefs.begin(PREFS_NAMESPACE, false)) {
+    return false;
+  }
+
+  g_prefs.putUShort(KEY_VER, SETTINGS_VERSION);
+  g_prefs.putBool(KEY_TEST, s.testingMode);
+  g_prefs.putBool(KEY_INVERT, s.invertDir);
+  g_prefs.putUChar(KEY_LASTMODE, s.lastMode);
+  g_prefs.putUInt(KEY_BOOTCOUNT, s.bootCount);
+
+  g_prefs.end();
+  return true;
+}
+
 // ------------------------------------------------------------
 // LovyanGFX display driver for LilyGO T-Display S3
 // ------------------------------------------------------------
-// ST7789 panel on 8-bit 8080 (I80) parallel bus.
 class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
  public:
   lgfx::Panel_ST7789   _panel;
@@ -66,11 +127,12 @@ class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
     }
 
     // ---- Backlight PWM ----
+    // Fix rolling "dark band" by raising PWM frequency well above visible range.
     {
       auto cfg = _light.config();
       cfg.pin_bl      = PIN_TFT_BL;
       cfg.invert      = false;
-      cfg.freq        = 12000;
+      cfg.freq        = 50000;   // was 12000; 50kHz reduces visible banding
       cfg.pwm_channel = 7;
       _light.config(cfg);
       _panel.setLight(&_light);
@@ -181,7 +243,7 @@ struct RotaryEncoder {
 };
 
 // ------------------------------------------------------------
-// AS5600 helpers
+// AS5600 helpers (still displayed)
 // ------------------------------------------------------------
 static constexpr uint8_t AS5600_ADDR = 0x36;
 
@@ -209,70 +271,82 @@ static float rawToDegrees(uint16_t raw) {
 }
 
 // ------------------------------------------------------------
-// UI drawing
+// UI
 // ------------------------------------------------------------
 static void flashTestPattern() {
-  lcd.fillScreen(lcd.color888(255, 0, 0)); delay(150);
-  lcd.fillScreen(lcd.color888(0, 255, 0)); delay(150);
-  lcd.fillScreen(lcd.color888(0, 0, 255)); delay(150);
-  lcd.fillScreen(lcd.color888(0, 0, 0));   delay(150);
+  lcd.fillScreen(lcd.color888(255, 0, 0)); delay(120);
+  lcd.fillScreen(lcd.color888(0, 255, 0)); delay(120);
+  lcd.fillScreen(lcd.color888(0, 0, 255)); delay(120);
+  lcd.fillScreen(lcd.color888(0, 0, 0));   delay(120);
 }
 
 static void drawStaticLayout() {
   lcd.fillScreen(lcd.color888(0, 0, 0));
 
-  lcd.setTextSize(2);
-  lcd.setTextColor(lcd.color888(255, 255, 255));
-  lcd.setCursor(8, 8);
-  lcd.print("SlidePilot Bring-up");
-
+  // Removed: title line + "Milestone 3..." line (per request)
+  // Keep only one compact instruction line to maximize vertical space.
   lcd.setTextSize(1);
-  lcd.setCursor(8, 36);
-  lcd.print("Buttons: A=GPIO0  B=GPIO14 (LOW=pressed)");
+  lcd.setTextColor(lcd.color888(255, 255, 255));
+  lcd.setCursor(6, 4);
+  lcd.print("SW: test  |  B: invert  |  ENC: mode  |  A: save");
 
-  lcd.setCursor(8, 50);
-  lcd.print("Encoder: CLK=GPIO17 DT=GPIO18 SW=GPIO1");
-
-  lcd.setCursor(8, 64);
-  lcd.print("I2C: SDA=GPIO21  SCL=GPIO16");
-
-  lcd.drawFastHLine(0, 78, lcd.width(), lcd.color888(60, 60, 60));
+  // Divider line
+  lcd.drawFastHLine(0, 18, lcd.width(), lcd.color888(60, 60, 60));
 }
 
 static void drawLiveStatus(
-  bool btnA, bool btnB,
-  bool encSw, int32_t encPos, int8_t encDelta,
+  const Settings& s,
+  bool btnA, bool btnB, bool encSw,
+  int32_t encPos, int8_t encDelta,
   bool as5600Present, bool as5600ReadOk, uint16_t raw, float deg,
-  uint16_t fps
+  uint16_t fps,
+  bool showSaved
 ) {
-  lcd.fillRect(0, 82, lcd.width(), lcd.height() - 82, lcd.color888(0, 0, 0));
+  // Clear live status area (below divider)
+  lcd.fillRect(0, 20, lcd.width(), lcd.height() - 20, lcd.color888(0, 0, 0));
 
   lcd.setTextSize(2);
-  lcd.setCursor(8, 88);
+  lcd.setCursor(8, 24);
   lcd.setTextColor(lcd.color888(255, 255, 0));
-  lcd.printf("A:%s  B:%s", btnA ? "ON" : "--", btnB ? "ON" : "--");
+  lcd.printf("A:%s  B:%s  SW:%s", btnA ? "ON" : "--", btnB ? "ON" : "--", encSw ? "ON" : "--");
 
-  lcd.setCursor(8, 112);
+  lcd.setCursor(8, 48);
   lcd.setTextColor(lcd.color888(0, 255, 255));
-  lcd.printf("ENC:%ld  d:%d  SW:%s", (long)encPos, (int)encDelta, encSw ? "ON" : "--");
+  lcd.printf("ENC:%ld  d:%d", (long)encPos, (int)encDelta);
 
   lcd.setTextSize(1);
   lcd.setTextColor(lcd.color888(180, 180, 180));
 
-  lcd.setCursor(8, 140);
+  lcd.setCursor(8, 74);
+  lcd.printf("testingMode: %s", s.testingMode ? "true" : "false");
+
+  lcd.setCursor(8, 88);
+  lcd.printf("invertDir:   %s", s.invertDir ? "true" : "false");
+
+  lcd.setCursor(8, 102);
+  lcd.printf("lastMode:    %u", (unsigned)s.lastMode);
+
+  lcd.setCursor(8, 116);
+  lcd.printf("bootCount:   %lu", (unsigned long)s.bootCount);
+
+  lcd.setCursor(8, 134);
   if (!as5600Present) {
     lcd.print("AS5600: NOT FOUND @0x36");
   } else if (!as5600ReadOk) {
     lcd.print("AS5600: present, read FAIL");
   } else {
-    lcd.printf("AS5600: raw=0x%03X  deg=%0.2f", raw, deg);
+    lcd.printf("AS5600: raw=0x%03X  deg=%0.1f", raw, deg);
   }
 
-  lcd.setCursor(8, 156);
+  lcd.setCursor(8, 150);
   lcd.printf("FPS: %u", (unsigned)fps);
 
-  lcd.setCursor(8, 174);
-  lcd.print("(Milestone 2: inputs debounced)");
+  if (showSaved) {
+    lcd.setTextSize(2);
+    lcd.setTextColor(lcd.color888(0, 255, 0));
+    lcd.setCursor(8, 170);
+    lcd.print("SAVED");
+  }
 }
 
 // ------------------------------------------------------------
@@ -283,9 +357,22 @@ static DebouncedInput g_btnB;
 static DebouncedInput g_encSw;
 static RotaryEncoder  g_enc;
 
+static Settings g_settings;
+
 static uint16_t g_fps = 0;
 static uint16_t g_frameCount = 0;
 static uint32_t g_lastFpsMs = 0;
+
+static uint32_t g_savedToastUntil = 0;
+
+static void markSavedToast() {
+  g_savedToastUntil = millis() + SAVED_TOAST_MS;
+}
+
+static void clampLastMode(Settings& s) {
+  if (s.lastMode < LASTMODE_MIN) s.lastMode = LASTMODE_MIN;
+  if (s.lastMode > LASTMODE_MAX) s.lastMode = LASTMODE_MAX;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -294,7 +381,7 @@ void setup() {
   // --- Motor safety: keep driver disabled + prevent floating STEP/DIR ---
   pinMode(PIN_TMC_STEP, OUTPUT); digitalWrite(PIN_TMC_STEP, LOW);
   pinMode(PIN_TMC_DIR,  OUTPUT); digitalWrite(PIN_TMC_DIR,  LOW);
-  pinMode(PIN_TMC_EN,   OUTPUT); digitalWrite(PIN_TMC_EN,   HIGH); // Active-LOW enable => HIGH disables
+  pinMode(PIN_TMC_EN,   OUTPUT); digitalWrite(PIN_TMC_EN,   HIGH); // Active-LOW => HIGH disables
   pinMode(PIN_TMC_UART_TX, INPUT);
   pinMode(PIN_TMC_UART_RX, INPUT);
 
@@ -311,6 +398,12 @@ void setup() {
   // --- I2C ---
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
+
+  // --- Settings load + boot counter ---
+  settingsLoad(g_settings);
+  g_settings.bootCount++;
+  settingsSave(g_settings);
+  markSavedToast();
 
   // --- LCD ---
   lcd.init();
@@ -329,15 +422,59 @@ void loop() {
   g_encSw.update();
   g_enc.update();
 
-  const bool btnA_pressed  = g_btnA.pressedActiveLow();
-  const bool btnB_pressed  = g_btnB.pressedActiveLow();
-  const bool encSw_pressed = g_encSw.pressedActiveLow();
+  const bool a = g_btnA.pressedActiveLow();
+  const bool b = g_btnB.pressedActiveLow();
+  const bool sw = g_encSw.pressedActiveLow();
 
+  // Edge detection
+  static bool prevA = false, prevB = false, prevSW = false;
+  const bool aPress = (a && !prevA);
+  const bool bPress = (b && !prevB);
+  const bool swPress = (sw && !prevSW);
+  prevA = a; prevB = b; prevSW = sw;
+
+  bool changed = false;
+
+  // Encoder changes lastMode
+  if (g_enc.detentDelta != 0) {
+    int newMode = (int)g_settings.lastMode + (int)g_enc.detentDelta;
+    if (newMode < (int)LASTMODE_MIN) newMode = LASTMODE_MIN;
+    if (newMode > (int)LASTMODE_MAX) newMode = LASTMODE_MAX;
+    if ((uint8_t)newMode != g_settings.lastMode) {
+      g_settings.lastMode = (uint8_t)newMode;
+      changed = true;
+    }
+  }
+
+  // SW toggles testingMode
+  if (swPress) {
+    g_settings.testingMode = !g_settings.testingMode;
+    changed = true;
+  }
+
+  // B toggles invertDir
+  if (bPress) {
+    g_settings.invertDir = !g_settings.invertDir;
+    changed = true;
+  }
+
+  // A forces save
+  if (aPress) {
+    settingsSave(g_settings);
+    markSavedToast();
+  }
+
+  if (changed) {
+    clampLastMode(g_settings);
+    settingsSave(g_settings);
+    markSavedToast();
+  }
+
+  // AS5600
   const bool as5600_present = i2cDevicePresent(AS5600_ADDR);
   uint16_t raw = 0;
   float deg = 0.0f;
   bool as5600_read_ok = false;
-
   if (as5600_present) {
     as5600_read_ok = as5600ReadRawAngle(raw);
     if (as5600_read_ok) deg = rawToDegrees(raw);
@@ -356,11 +493,14 @@ void loop() {
   static uint32_t lastUiMs = 0;
   if (now - lastUiMs >= UI_UPDATE_MS) {
     lastUiMs = now;
+    const bool showSaved = (now < g_savedToastUntil);
     drawLiveStatus(
-      btnA_pressed, btnB_pressed,
-      encSw_pressed, g_enc.detentPos, g_enc.detentDelta,
+      g_settings,
+      a, b, sw,
+      g_enc.detentPos, g_enc.detentDelta,
       as5600_present, as5600_read_ok, raw, deg,
-      g_fps
+      g_fps,
+      showSaved
     );
   }
 
