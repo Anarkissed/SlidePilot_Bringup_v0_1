@@ -1,12 +1,15 @@
 #pragma once
 #include <Arduino.h>
-#include <Preferences.h>
 
 struct Settings {
-  uint8_t markerCount = 2;   // 2..6
-  bool    testingMode = false;
-  bool    invertDir   = false;
+  bool testingMode = false;
+  bool invertDir   = false;
+  uint8_t lastMode = 0;
+  uint32_t bootCount = 0;
+
+  // versioning
+  uint16_t version = 1;
 };
 
-void settingsLoad(Preferences& prefs, Settings& s);
-void settingsSave(Preferences& prefs, const Settings& s);
+void settingsLoad(Settings& s);
+void settingsSave(const Settings& s);

@@ -1,275 +1,336 @@
 #include "Display.h"
 
-#include <algorithm>
-
-#include "MarkerIcons.h"
+#include <Arduino.h>
 
 namespace {
 
-// --- Theme colors (RGB565) ---
+// -----------------------------------------------------------------------------
+// Theme
+// -----------------------------------------------------------------------------
+
 static constexpr uint16_t C_BG     = 0x0000; // black
 static constexpr uint16_t C_SURF   = 0x18E3; // dark gray-blue
 static constexpr uint16_t C_PILL   = 0x2104; // slightly lighter
 static constexpr uint16_t C_TEXT   = 0xFFFF; // white
 static constexpr uint16_t C_DIM    = 0x8410; // mid gray
-static constexpr uint16_t C_ACCENT = 0x07FF; // cyan
+static constexpr uint16_t C_ACCENT = 0x3D7F; // a brighter cyan-ish
 
-struct Metrics {
-  int16_t W = 0;
-  int16_t H = 0;
-  int16_t pad = 8;
-
-  // Header
-  int16_t headerX = 0;
-  int16_t headerY = 0;
-  int16_t headerW = 0;
-  int16_t headerH = 0;
-  int16_t headerR = 0;
-
-  // Content
-  int16_t contentX = 0;
-  int16_t contentY = 0;
-  int16_t contentW = 0;
-  int16_t contentH = 0;
-  int16_t contentR = 0;
-
-  // Bottom pills
-  int16_t bottomY = 0;
-  int16_t pillH = 26;
-  int16_t pillW = 92;
-  int16_t pillR = 13;
-  int16_t gap = 10;
-};
-
-inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
-  return (v < lo) ? lo : (v > hi) ? hi : v;
+static int clampi(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
 }
 
-static Metrics computeMetrics(lgfx::LGFX_Device* lcd) {
+// -----------------------------------------------------------------------------
+// Layout metrics
+// -----------------------------------------------------------------------------
+struct Metrics {
+  int W = 0;
+  int H = 0;
+  int pad = 8;
+
+  // Top pills
+  int headerX = 0;
+  int headerY = 0;
+  int headerW = 0;
+  int headerH = 28;
+  int headerR = 14;
+
+  int topRightX = 0;
+  int topRightY = 0;
+  int topRightW = 86;
+  int topRightH = 28;
+  int topRightR = 14;
+
+  // Content card
+  int contentX = 0;
+  int contentY = 0;
+  int contentW = 0;
+  int contentH = 0;
+  int contentR = 22;
+
+  // Bottom pills
+  int bottomY = 0;
+  int pillH = 26;
+  int pillW = 78;
+  int pillR = 13;
+};
+
+static Metrics calcMetrics(lgfx::LGFX_Device* lcd) {
   Metrics m;
-  m.W = static_cast<int16_t>(lcd->width());
-  m.H = static_cast<int16_t>(lcd->height());
+  m.W = lcd->width();
+  m.H = lcd->height();
   m.pad = 8;
 
+  m.headerH = 28;
+  m.headerR = m.headerH / 2;
+  m.headerW = m.W / 2;   // half screen width
   m.headerX = m.pad;
   m.headerY = m.pad;
-  m.headerW = std::max<int16_t>(m.W / 2, 140); // note: header pill should be ~half screen, never truncate titles
-  m.headerH = 26;
-  m.headerR = m.headerH / 2;
 
-  // Bottom area = pad + pills + pad (to match top padding reference)
-  m.bottomY = m.H - (m.pad + m.pillH);
+  m.topRightW = 86;
+  m.topRightH = 28;
+  m.topRightR = m.topRightH / 2;
+  m.topRightX = m.W - m.pad - m.topRightW;
+  m.topRightY = m.pad;
 
+  m.bottomY = m.H - m.pad - m.pillH;
+
+  // content card sits between top pills row and bottom pills row
+  const int contentTop = m.headerY + m.headerH + 8;
+  const int contentBottom = m.bottomY - 8;
   m.contentX = m.pad;
-  m.contentY = m.headerY + m.headerH + m.pad;
-  m.contentW = m.W - 2 * m.pad;
-  m.contentH = m.bottomY - m.pad - m.contentY; // ensures bottom padding equals top pad
-  m.contentH = std::max<int16_t>(m.contentH, 30);
-  m.contentR = 18;
-
-  // Adjust pill size if needed for narrow screens
-  int16_t total = (3 * m.pillW) + (2 * m.gap);
-  if (total > (m.W - 2 * m.pad)) {
-    int16_t avail = (m.W - 2 * m.pad) - (2 * m.gap);
-    m.pillW = clampi(avail / 3, 60, 110);
-  }
+  m.contentY = contentTop;
+  m.contentW = m.W - (m.pad * 2);
+  m.contentH = contentBottom - contentTop;
+  m.contentR = 22;
 
   return m;
 }
 
-static void drawPill(lgfx::LGFX_Sprite& spr, int x, int y, int w, int h, uint16_t fill,
-                     const char* text, bool selected, bool dimText, int textSize = 1) {
-  int r = h / 2;
-  spr.fillRoundRect(x, y, w, h, r, fill);
+// -----------------------------------------------------------------------------
+// Drawing helpers
+// -----------------------------------------------------------------------------
+
+static void safeString(lgfx::LovyanGFX* g, const char* txt, int x, int y) {
+  g->drawString(txt ? txt : "", x, y);
+}
+
+static void pill(lgfx::LovyanGFX* g,
+                 int x, int y, int w, int h,
+                 const char* text,
+                 bool selected,
+                 bool big,
+                 bool disabled = false) {
+  const int r = h / 2;
+  g->fillRoundRect(x, y, w, h, r, C_PILL);
   if (selected) {
-    spr.drawRoundRect(x - 1, y - 1, w + 2, h + 2, r + 1, C_ACCENT);
+    g->drawRoundRect(x - 1, y - 1, w + 2, h + 2, r + 1, C_ACCENT);
   }
 
-  spr.setTextDatum(middle_center);
-  spr.setTextSize(textSize);
-  spr.setTextColor(dimText ? C_DIM : C_TEXT);
-  spr.drawString(text, x + w / 2, y + h / 2);
+  g->setTextDatum(middle_center);
+  g->setTextSize(big ? 2 : 1);
+  g->setTextColor(disabled ? C_DIM : C_TEXT);
+  safeString(g, text, x + w / 2, y + h / 2);
 }
 
-static void drawHeader(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
-  // Header pill always visible with latest header; make the text a little larger.
-  spr.fillRoundRect(m.headerX, m.headerY, m.headerW, m.headerH, m.headerR, C_PILL);
-  spr.setTextDatum(middle_center);
-  spr.setTextSize(2);
-  spr.setTextColor(C_TEXT);
-  spr.drawString(s.header, m.headerX + m.headerW / 2, m.headerY + m.headerH / 2);
+// Camera icon (outline primitives)
+static void drawCameraIcon(lgfx::LovyanGFX* g, int cx, int cy, int sz, uint16_t col) {
+  const int w = sz;
+  const int h = (sz * 3) / 5;
+  const int x = cx - w / 2;
+  const int y = cy - h / 2;
+
+  const int r = 6;
+
+  // main body outline
+  g->drawRoundRect(x, y, w, h, r, col);
+  g->drawRoundRect(x + 1, y + 1, w - 2, h - 2, r, col);
+
+  // top bump
+  const int bumpW = (w * 2) / 5;
+  const int bumpH = (h * 2) / 5;
+  const int bumpX = x + (w - bumpW) / 2;
+  const int bumpY = y - bumpH / 2;
+  g->drawRoundRect(bumpX, bumpY, bumpW, bumpH, 4, col);
+
+  // lens circle
+  const int lr = h / 3;
+  g->drawCircle(cx, cy, lr, col);
+  g->drawCircle(cx, cy, lr - 1, col);
+
+  // small dot
+  g->fillCircle(x + (w * 1) / 6, y + (h * 1) / 3, 2, col);
 }
 
-static void drawContentFrame(lgfx::LGFX_Sprite& spr, const Metrics& m) {
-  spr.fillRoundRect(m.contentX, m.contentY, m.contentW, m.contentH, m.contentR, C_SURF);
+// Down triangle (pointing down)
+static void drawDownTriangle(lgfx::LovyanGFX* g, int cx, int cy, int w, int h, uint16_t col) {
+  g->fillTriangle(cx, cy + h / 2, cx - w / 2, cy - h / 2, cx + w / 2, cy - h / 2, col);
 }
 
-static void drawMainScreen(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
-  // Content title
-  spr.setTextDatum(top_left);
-  spr.setTextSize(2);
-  spr.setTextColor(C_TEXT);
-  spr.drawString("Main", m.contentX + 14, m.contentY + 12);
-
-  // Marker row + timeline (simple bring-up rendering)
-  const int rowY = m.contentY + 52;
-  const int centerY = rowY + 38;
-  const int iconSz = 34;
-  const int arrowH = 14;
-
-  const int leftX = m.contentX + 20;
-  const int rightX = m.contentX + m.contentW - 20;
-
-  const int positions[3] = {
-      leftX,
-      m.contentX + m.contentW / 2,
-      rightX,
-  };
-
-  // Timeline line behind icons
-  spr.drawLine(positions[0], centerY + iconSz / 2, positions[2], centerY + iconSz / 2, C_DIM);
-
-  // Arrow is ABOVE marker (per your note)
-  if (s.mainFocus >= MainFocus::MARKER1 && s.mainFocus <= MainFocus::MARKER3) {
-    int idx = static_cast<int>(s.mainFocus) - static_cast<int>(MainFocus::MARKER1);
-    idx = clampi(idx, 0, 2);
-    int ax = positions[idx];
-    int ay = centerY - arrowH - 6;
-    spr.fillTriangle(ax, ay, ax - 8, ay + arrowH, ax + 8, ay + arrowH, C_ACCENT);
-  }
-
-  // Marker icons
-  for (int i = 0; i < 3; ++i) {
-    bool focused = (s.mainFocus == static_cast<MainFocus>(static_cast<int>(MainFocus::MARKER1) + i));
-    const MarkerState& ms = s.markers[i];
-    MarkerIconKind kind = MarkerIconKind::EMPTY;
-    if (ms.set) {
-      kind = MarkerIconKind::CHECK;
-    }
-    const IconSpec spec = getMarkerIcon(kind);
-    drawIcon(spr, spec, positions[i] - iconSz / 2, centerY, iconSz, focused ? C_ACCENT : C_TEXT);
-  }
-
-  // Hint text (kept within content area)
-  spr.setTextDatum(bottom_left);
-  spr.setTextSize(1);
-  spr.setTextColor(C_DIM);
-  spr.drawString("Back saves & exits", m.contentX + 14, m.contentY + m.contentH - 14);
-}
-
-static void drawSettingsScreen(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
-  spr.setTextDatum(top_left);
-  spr.setTextSize(2);
-  spr.setTextColor(C_TEXT);
-  spr.drawString("Settings", m.contentX + 14, m.contentY + 12);
-
-  spr.setTextSize(1);
-  spr.setTextColor(C_DIM);
-  spr.drawString("(bring-up)", m.contentX + 14, m.contentY + 38);
-}
-
-static void drawRunningScreen(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
-  spr.setTextDatum(top_left);
-  spr.setTextSize(2);
-  spr.setTextColor(C_TEXT);
-  spr.drawString("Running", m.contentX + 14, m.contentY + 12);
-
-  spr.setTextSize(1);
-  spr.setTextColor(C_DIM);
-  spr.drawString("Press Cancel to stop", m.contentX + 14, m.contentY + 42);
-
-  if (s.popup == PopupKind::CANCEL_CONFIRM) {
-    // Simple modal
-    const int pw = std::min<int>(240, m.contentW - 20);
-    const int ph = 110;
-    const int px = m.contentX + (m.contentW - pw) / 2;
-    const int py = m.contentY + (m.contentH - ph) / 2;
-    spr.fillRoundRect(px, py, pw, ph, 18, C_PILL);
-    spr.drawRoundRect(px, py, pw, ph, 18, C_ACCENT);
-
-    spr.setTextDatum(top_center);
-    spr.setTextSize(2);
-    spr.setTextColor(C_TEXT);
-    spr.drawString("Cancel move?", px + pw / 2, py + 10);
-
-    // Default highlight is NO (per your note)
-    bool yesSelected = (s.cancelConfirmSelection == CancelConfirmSelection::YES);
-    int by = py + ph - 40;
-    int bw = (pw - 30) / 2;
-    drawPill(spr, px + 10, by, bw, 26, C_SURF, "No", !yesSelected, false, 1);
-    drawPill(spr, px + 20 + bw, by, bw, 26, C_SURF, "Yes", yesSelected, false, 1);
+// Mode icons (bottom center) — NO mode name text here
+static void drawModeIcon(lgfx::LovyanGFX* g, SlideMode mode, int cx, int cy, int sz, uint16_t col) {
+  if (mode == SlideMode::Single) {
+    // →
+    const int w = sz;
+    const int h = sz / 2;
+    g->drawLine(cx - w / 2, cy, cx + w / 2 - 6, cy, col);
+    g->fillTriangle(cx + w / 2 - 6, cy,
+                    cx + w / 2 - 14, cy - h / 2,
+                    cx + w / 2 - 14, cy + h / 2, col);
+  } else if (mode == SlideMode::Bounce) {
+    // ↔
+    const int w = sz;
+    const int h = sz / 2;
+    g->drawLine(cx - w / 2 + 6, cy, cx + w / 2 - 6, cy, col);
+    g->fillTriangle(cx - w / 2 + 6, cy,
+                    cx - w / 2 + 14, cy - h / 2,
+                    cx - w / 2 + 14, cy + h / 2, col);
+    g->fillTriangle(cx + w / 2 - 6, cy,
+                    cx + w / 2 - 14, cy - h / 2,
+                    cx + w / 2 - 14, cy + h / 2, col);
+  } else {
+    // stacked frames
+    const int s = sz / 2;
+    g->drawRect(cx - s,     cy - s,     s * 2, s * 2, col);
+    g->drawRect(cx - s - 4, cy - s - 4, s * 2, s * 2, col);
+    g->drawRect(cx - s - 8, cy - s - 8, s * 2, s * 2, col);
   }
 }
 
-static void drawBottomPills(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
-  int totalW = (3 * m.pillW) + (2 * m.gap);
-  int x0 = m.pad + (m.W - 2 * m.pad - totalW) / 2;
-  int y = m.bottomY;
+static const char* modeTitle(SlideMode m) {
+  switch (m) {
+    case SlideMode::Single:    return "SINGLE";
+    case SlideMode::Bounce:    return "BOUNCE";
+    case SlideMode::Timelapse: return "TIMELAPSE";
+  }
+  return "SINGLE";
+}
 
-  bool backSel = (s.mainFocus == MainFocus::BACK);
-  bool setSel = (s.mainFocus == MainFocus::SETTINGS);
-  bool nextSel = (s.mainFocus == MainFocus::NEXT);
-
-  drawPill(spr, x0, y, m.pillW, m.pillH, C_PILL, "Back", backSel, false, 1);
-  drawPill(spr, x0 + m.pillW + m.gap, y, m.pillW, m.pillH, C_PILL, "Settings", setSel, false, 1);
-  drawPill(spr, x0 + 2 * (m.pillW + m.gap), y, m.pillW, m.pillH, C_PILL, "Next", nextSel, false, 1);
+static void markerPositions(const Metrics& m, int outX[UiState::kMaxMarkers]) {
+  const int left  = m.contentX + 44;
+  const int right = m.contentX + m.contentW - 44;
+  const int n = UiState::kMaxMarkers;
+  for (int i = 0; i < n; ++i) {
+    outX[i] = left + (i * (right - left)) / (n - 1);
+  }
 }
 
 } // namespace
 
-void DisplayUI::begin(lgfx::LGFX_Device* dev) {
-  _lcd = dev;
-  if (!_lcd) {
-    return;
-  }
+// ----------------------------------------------------------------------------
+// DisplayUI implementation
+// ----------------------------------------------------------------------------
 
-  // Create sprite after the panel is initialized.
-  _spr.setColorDepth(16);
-  _spr.setFont(&fonts::Font2);
-  _spr.setPsram(true);
-  _spr.createSprite(_lcd->width(), _lcd->height());
+bool DisplayUI::begin(lgfx::LGFX_Device* dev) {
+  _lcd = dev;
+  if (!_lcd) return false;
+
+  _W = _lcd->width();
+  _H = _lcd->height();
+
+  // ✅ CRITICAL FIX:
+  // Disable full-frame sprites for now — this is what’s causing the boot-loop.
+  _useSprite = false;
+
+  return true;
 }
 
-void DisplayUI::draw(const UiState& state) {
-  if (!_lcd) {
+void DisplayUI::render(const UiState& s) {
+  if (!_lcd) return;
+
+  // ✅ Direct draw (no sprite = no crash)
+  lgfx::LovyanGFX* g = _lcd;
+
+  const Metrics m = calcMetrics(_lcd);
+
+  // Base clear
+  g->fillScreen(C_BG);
+
+  // Header pill (top-left) always mode title
+  pill(g, m.headerX, m.headerY, m.headerW, m.headerH, modeTitle(s.mode), false, true);
+
+  // Top-right settings pill only Main + Settings
+  const bool showSettingsPill = (s.screen == UiScreen::Main || s.screen == UiScreen::Settings);
+  if (showSettingsPill) {
+    const bool sel = (s.screen == UiScreen::Main && s.mainFocus == MainFocus::Settings);
+    pill(g, m.topRightX, m.topRightY, m.topRightW, m.topRightH, "Settings", sel, false);
+  }
+
+  // Content container
+  g->fillRoundRect(m.contentX, m.contentY, m.contentW, m.contentH, m.contentR, C_SURF);
+
+  // ---------------------------------------------------------------------------
+  // MAIN
+  // ---------------------------------------------------------------------------
+  if (s.screen == UiScreen::Main) {
+    const int innerX = m.contentX;
+    const int innerY = m.contentY;
+    const int innerW = m.contentW;
+    const int innerH = m.contentH;
+
+    // pad -> camera -> pad -> triangle -> pad -> timeline -> pad
+    const int topPad = 14;
+    const int bottomPad = 14;
+    const int cameraSz = 42;
+    const int triW = 18;
+    const int triH = 14;
+    const int tlH = 40;
+
+    const int total = topPad + cameraSz + topPad + triH + topPad + tlH + bottomPad;
+    int startY = innerY + (innerH - total) / 2;
+    if (startY < innerY + 10) startY = innerY + 10;
+
+    const int camCX = innerX + 30;
+    const int camCY = startY + topPad + cameraSz / 2;
+
+    const bool focusIsMarker = (s.mainFocus >= MainFocus::Marker1 && s.mainFocus <= MainFocus::Marker6);
+    const int focusMarkerIdx = focusIsMarker
+      ? (static_cast<int>(s.mainFocus) - static_cast<int>(MainFocus::Marker1))
+      : -1;
+
+    const bool showTriangleHighlight = focusIsMarker;
+
+    drawCameraIcon(g, camCX, camCY, cameraSz, showTriangleHighlight ? C_ACCENT : C_TEXT);
+
+    const int triCX = camCX;
+    const int triCY = camCY + (cameraSz / 2) + topPad + triH / 2;
+    drawDownTriangle(g, triCX, triCY, triW, triH, showTriangleHighlight ? C_ACCENT : C_TEXT);
+
+    const int tlY = triCY + triH / 2 + topPad;
+    const int baseY = tlY + (tlH * 2) / 3;
+
+    int posX[UiState::kMaxMarkers];
+    markerPositions(m, posX);
+
+    g->drawLine(posX[0], baseY, posX[UiState::kMaxMarkers - 1], baseY, C_DIM);
+
+    if (showTriangleHighlight) {
+      const int idx = clampi(focusMarkerIdx, 0, UiState::kMaxMarkers - 1);
+      const int ax = posX[idx];
+      const int ay = baseY - 24;
+      g->fillTriangle(ax, ay, ax - 8, ay + 10, ax + 8, ay + 10, C_ACCENT);
+    }
+
+    for (int i = 0; i < UiState::kMaxMarkers; ++i) {
+      const bool activeSlot = (i < s.markerCount);
+      const bool set = activeSlot ? s.markers[i].set : false;
+      const bool focused = (focusIsMarker && i == focusMarkerIdx);
+      const int r = 10;
+
+      g->fillCircle(posX[i], baseY, r, C_SURF);
+      g->drawCircle(posX[i], baseY, r, focused ? C_ACCENT : (activeSlot ? C_TEXT : C_DIM));
+
+      if (set) {
+        g->fillCircle(posX[i], baseY, 4, focused ? C_ACCENT : C_TEXT);
+      }
+    }
+
+    // Bottom pills
+    const int nextX = m.contentX + 14;
+    const int nextY = m.bottomY;
+    const int nextW = 78;
+    const int modeW = 78;
+    const int modeX = m.W - m.pad - modeW;
+
+    const bool nextSel = (s.mainFocus == MainFocus::Next);
+    const bool modeSel = (s.mainFocus == MainFocus::Mode);
+    pill(g, nextX, nextY, nextW, m.pillH, "Next", nextSel, false);
+    pill(g, modeX, nextY, modeW, m.pillH, "Mode", modeSel, false);
+
+    // Mode icon between pills
+    const int iconCX = (nextX + nextW + modeX) / 2;
+    const int iconCY = nextY + m.pillH / 2;
+    drawModeIcon(g, s.mode, iconCX, iconCY, 20, C_TEXT);
+
     return;
   }
 
-  // Recreate sprite if rotation/size changed.
-  if (_spr.width() != _lcd->width() || _spr.height() != _lcd->height()) {
-    _spr.deleteSprite();
-    _spr.setColorDepth(16);
-    _spr.setPsram(true);
-    _spr.createSprite(_lcd->width(), _lcd->height());
-  }
-
-  const Metrics m = computeMetrics(_lcd);
-
-  _spr.fillScreen(C_BG);
-
-  drawHeader(_spr, m, state);
-  drawContentFrame(_spr, m);
-
-  switch (state.screen) {
-    case UiScreen::MAIN:
-      drawMainScreen(_spr, m, state);
-      break;
-    case UiScreen::SETTINGS:
-      drawSettingsScreen(_spr, m, state);
-      break;
-    case UiScreen::RUNNING:
-      drawRunningScreen(_spr, m, state);
-      break;
-    default:
-      // fallback
-      _spr.setTextDatum(middle_center);
-      _spr.setTextSize(2);
-      _spr.setTextColor(C_TEXT);
-      _spr.drawString("(unimplemented)", m.W / 2, m.H / 2);
-      break;
-  }
-
-  drawBottomPills(_spr, m, state);
-
-  _spr.pushSprite(0, 0);
+  // ---------------------------------------------------------------------------
+  // Fallback screens (so we always show something)
+  // ---------------------------------------------------------------------------
+  g->setTextDatum(middle_center);
+  g->setTextSize(2);
+  g->setTextColor(C_TEXT);
+  safeString(g, "RUNNING", m.W / 2, m.H / 2);
 }
