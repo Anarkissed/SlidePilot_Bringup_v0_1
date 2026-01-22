@@ -1,36 +1,28 @@
 #include "Settings.h"
-#include <Preferences.h>
 
-static const char* kNs = "slidepilot";
+static const char* kPrefsNS = "slidepilot";
 
-void settingsLoad(Settings& s) {
-  Preferences prefs;
-  if (!prefs.begin(kNs, true)) {
-    // defaults
-    s = Settings{};
-    return;
-  }
+void settingsLoad(Preferences& prefs, Settings& s) {
+  // Open RO (true) to avoid accidental writes during load
+  if (!prefs.begin(kPrefsNS, true)) return;
 
-  const uint16_t ver = prefs.getUShort("ver", 1);
-  s.version = ver;
-
-  s.testingMode = prefs.getBool("test", false);
-  s.invertDir   = prefs.getBool("inv", false);
-  s.lastMode    = prefs.getUChar("mode", 0);
-  s.bootCount   = prefs.getULong("boot", 0);
+  s.markerCount = (uint8_t)prefs.getUChar("markerCount", s.markerCount);
+  s.testingMode = prefs.getBool("testingMode", s.testingMode);
+  s.invertDir   = prefs.getBool("invertDir", s.invertDir);
 
   prefs.end();
+
+  // clamp markerCount 2..6
+  if (s.markerCount < 2) s.markerCount = 2;
+  if (s.markerCount > 6) s.markerCount = 6;
 }
 
-void settingsSave(const Settings& s) {
-  Preferences prefs;
-  if (!prefs.begin(kNs, false)) return;
+void settingsSave(Preferences& prefs, const Settings& s) {
+  if (!prefs.begin(kPrefsNS, false)) return;
 
-  prefs.putUShort("ver", s.version);
-  prefs.putBool("test", s.testingMode);
-  prefs.putBool("inv",  s.invertDir);
-  prefs.putUChar("mode", s.lastMode);
-  prefs.putULong("boot", s.bootCount);
+  prefs.putUChar("markerCount", s.markerCount);
+  prefs.putBool("testingMode", s.testingMode);
+  prefs.putBool("invertDir", s.invertDir);
 
   prefs.end();
 }

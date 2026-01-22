@@ -1,353 +1,275 @@
 #include "Display.h"
 
-static void logSpriteStatus(bool useSprite, int depth, bool psram) {
-  Serial.printf("[DisplayUI] sprite=%s depth=%d psram=%s\n",
-                useSprite ? "ON" : "OFF",
-                depth,
-                psram ? "true" : "false");
+#include <algorithm>
+
+#include "MarkerIcons.h"
+
+namespace {
+
+// --- Theme colors (RGB565) ---
+static constexpr uint16_t C_BG     = 0x0000; // black
+static constexpr uint16_t C_SURF   = 0x18E3; // dark gray-blue
+static constexpr uint16_t C_PILL   = 0x2104; // slightly lighter
+static constexpr uint16_t C_TEXT   = 0xFFFF; // white
+static constexpr uint16_t C_DIM    = 0x8410; // mid gray
+static constexpr uint16_t C_ACCENT = 0x07FF; // cyan
+
+struct Metrics {
+  int16_t W = 0;
+  int16_t H = 0;
+  int16_t pad = 8;
+
+  // Header
+  int16_t headerX = 0;
+  int16_t headerY = 0;
+  int16_t headerW = 0;
+  int16_t headerH = 0;
+  int16_t headerR = 0;
+
+  // Content
+  int16_t contentX = 0;
+  int16_t contentY = 0;
+  int16_t contentW = 0;
+  int16_t contentH = 0;
+  int16_t contentR = 0;
+
+  // Bottom pills
+  int16_t bottomY = 0;
+  int16_t pillH = 26;
+  int16_t pillW = 92;
+  int16_t pillR = 13;
+  int16_t gap = 10;
+};
+
+inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
+  return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-bool DisplayUI::begin(lgfx::LGFX_Device* dev) {
+static Metrics computeMetrics(lgfx::LGFX_Device* lcd) {
+  Metrics m;
+  m.W = static_cast<int16_t>(lcd->width());
+  m.H = static_cast<int16_t>(lcd->height());
+  m.pad = 8;
+
+  m.headerX = m.pad;
+  m.headerY = m.pad;
+  m.headerW = std::max<int16_t>(m.W / 2, 140); // note: header pill should be ~half screen, never truncate titles
+  m.headerH = 26;
+  m.headerR = m.headerH / 2;
+
+  // Bottom area = pad + pills + pad (to match top padding reference)
+  m.bottomY = m.H - (m.pad + m.pillH);
+
+  m.contentX = m.pad;
+  m.contentY = m.headerY + m.headerH + m.pad;
+  m.contentW = m.W - 2 * m.pad;
+  m.contentH = m.bottomY - m.pad - m.contentY; // ensures bottom padding equals top pad
+  m.contentH = std::max<int16_t>(m.contentH, 30);
+  m.contentR = 18;
+
+  // Adjust pill size if needed for narrow screens
+  int16_t total = (3 * m.pillW) + (2 * m.gap);
+  if (total > (m.W - 2 * m.pad)) {
+    int16_t avail = (m.W - 2 * m.pad) - (2 * m.gap);
+    m.pillW = clampi(avail / 3, 60, 110);
+  }
+
+  return m;
+}
+
+static void drawPill(lgfx::LGFX_Sprite& spr, int x, int y, int w, int h, uint16_t fill,
+                     const char* text, bool selected, bool dimText, int textSize = 1) {
+  int r = h / 2;
+  spr.fillRoundRect(x, y, w, h, r, fill);
+  if (selected) {
+    spr.drawRoundRect(x - 1, y - 1, w + 2, h + 2, r + 1, C_ACCENT);
+  }
+
+  spr.setTextDatum(middle_center);
+  spr.setTextSize(textSize);
+  spr.setTextColor(dimText ? C_DIM : C_TEXT);
+  spr.drawString(text, x + w / 2, y + h / 2);
+}
+
+static void drawHeader(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
+  // Header pill always visible with latest header; make the text a little larger.
+  spr.fillRoundRect(m.headerX, m.headerY, m.headerW, m.headerH, m.headerR, C_PILL);
+  spr.setTextDatum(middle_center);
+  spr.setTextSize(2);
+  spr.setTextColor(C_TEXT);
+  spr.drawString(s.header, m.headerX + m.headerW / 2, m.headerY + m.headerH / 2);
+}
+
+static void drawContentFrame(lgfx::LGFX_Sprite& spr, const Metrics& m) {
+  spr.fillRoundRect(m.contentX, m.contentY, m.contentW, m.contentH, m.contentR, C_SURF);
+}
+
+static void drawMainScreen(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
+  // Content title
+  spr.setTextDatum(top_left);
+  spr.setTextSize(2);
+  spr.setTextColor(C_TEXT);
+  spr.drawString("Main", m.contentX + 14, m.contentY + 12);
+
+  // Marker row + timeline (simple bring-up rendering)
+  const int rowY = m.contentY + 52;
+  const int centerY = rowY + 38;
+  const int iconSz = 34;
+  const int arrowH = 14;
+
+  const int leftX = m.contentX + 20;
+  const int rightX = m.contentX + m.contentW - 20;
+
+  const int positions[3] = {
+      leftX,
+      m.contentX + m.contentW / 2,
+      rightX,
+  };
+
+  // Timeline line behind icons
+  spr.drawLine(positions[0], centerY + iconSz / 2, positions[2], centerY + iconSz / 2, C_DIM);
+
+  // Arrow is ABOVE marker (per your note)
+  if (s.mainFocus >= MainFocus::MARKER1 && s.mainFocus <= MainFocus::MARKER3) {
+    int idx = static_cast<int>(s.mainFocus) - static_cast<int>(MainFocus::MARKER1);
+    idx = clampi(idx, 0, 2);
+    int ax = positions[idx];
+    int ay = centerY - arrowH - 6;
+    spr.fillTriangle(ax, ay, ax - 8, ay + arrowH, ax + 8, ay + arrowH, C_ACCENT);
+  }
+
+  // Marker icons
+  for (int i = 0; i < 3; ++i) {
+    bool focused = (s.mainFocus == static_cast<MainFocus>(static_cast<int>(MainFocus::MARKER1) + i));
+    const MarkerState& ms = s.markers[i];
+    MarkerIconKind kind = MarkerIconKind::EMPTY;
+    if (ms.set) {
+      kind = MarkerIconKind::CHECK;
+    }
+    const IconSpec spec = getMarkerIcon(kind);
+    drawIcon(spr, spec, positions[i] - iconSz / 2, centerY, iconSz, focused ? C_ACCENT : C_TEXT);
+  }
+
+  // Hint text (kept within content area)
+  spr.setTextDatum(bottom_left);
+  spr.setTextSize(1);
+  spr.setTextColor(C_DIM);
+  spr.drawString("Back saves & exits", m.contentX + 14, m.contentY + m.contentH - 14);
+}
+
+static void drawSettingsScreen(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
+  spr.setTextDatum(top_left);
+  spr.setTextSize(2);
+  spr.setTextColor(C_TEXT);
+  spr.drawString("Settings", m.contentX + 14, m.contentY + 12);
+
+  spr.setTextSize(1);
+  spr.setTextColor(C_DIM);
+  spr.drawString("(bring-up)", m.contentX + 14, m.contentY + 38);
+}
+
+static void drawRunningScreen(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
+  spr.setTextDatum(top_left);
+  spr.setTextSize(2);
+  spr.setTextColor(C_TEXT);
+  spr.drawString("Running", m.contentX + 14, m.contentY + 12);
+
+  spr.setTextSize(1);
+  spr.setTextColor(C_DIM);
+  spr.drawString("Press Cancel to stop", m.contentX + 14, m.contentY + 42);
+
+  if (s.popup == PopupKind::CANCEL_CONFIRM) {
+    // Simple modal
+    const int pw = std::min<int>(240, m.contentW - 20);
+    const int ph = 110;
+    const int px = m.contentX + (m.contentW - pw) / 2;
+    const int py = m.contentY + (m.contentH - ph) / 2;
+    spr.fillRoundRect(px, py, pw, ph, 18, C_PILL);
+    spr.drawRoundRect(px, py, pw, ph, 18, C_ACCENT);
+
+    spr.setTextDatum(top_center);
+    spr.setTextSize(2);
+    spr.setTextColor(C_TEXT);
+    spr.drawString("Cancel move?", px + pw / 2, py + 10);
+
+    // Default highlight is NO (per your note)
+    bool yesSelected = (s.cancelConfirmSelection == CancelConfirmSelection::YES);
+    int by = py + ph - 40;
+    int bw = (pw - 30) / 2;
+    drawPill(spr, px + 10, by, bw, 26, C_SURF, "No", !yesSelected, false, 1);
+    drawPill(spr, px + 20 + bw, by, bw, 26, C_SURF, "Yes", yesSelected, false, 1);
+  }
+}
+
+static void drawBottomPills(lgfx::LGFX_Sprite& spr, const Metrics& m, const UiState& s) {
+  int totalW = (3 * m.pillW) + (2 * m.gap);
+  int x0 = m.pad + (m.W - 2 * m.pad - totalW) / 2;
+  int y = m.bottomY;
+
+  bool backSel = (s.mainFocus == MainFocus::BACK);
+  bool setSel = (s.mainFocus == MainFocus::SETTINGS);
+  bool nextSel = (s.mainFocus == MainFocus::NEXT);
+
+  drawPill(spr, x0, y, m.pillW, m.pillH, C_PILL, "Back", backSel, false, 1);
+  drawPill(spr, x0 + m.pillW + m.gap, y, m.pillW, m.pillH, C_PILL, "Settings", setSel, false, 1);
+  drawPill(spr, x0 + 2 * (m.pillW + m.gap), y, m.pillW, m.pillH, C_PILL, "Next", nextSel, false, 1);
+}
+
+} // namespace
+
+void DisplayUI::begin(lgfx::LGFX_Device* dev) {
   _lcd = dev;
-  if (!_lcd) return false;
-
-  computeMetrics();
-  _gfx = _lcd;
-
-  // Sprite usage currently disabled (stable + no tearing work yet)
-  logSpriteStatus(false, 0, false);
-  return true;
-}
-
-void DisplayUI::computeMetrics() {
-  _ui.W = (int)_lcd->width();
-  _ui.H = (int)_lcd->height();
-
-  // HTML canvas reference: W=480 H=270
-  const float sx = (float)_ui.W / 480.0f;
-  const float sy = (float)_ui.H / 270.0f;
-
-  auto scX = [&](int v) { return (int)lroundf(v * sx); };
-  auto scY = [&](int v) { return (int)lroundf(v * sy); };
-  auto scR = [&](int v) { return (int)lroundf(v * (sx + sy) * 0.5f); };
-
-  _ui.pad         = scX(14);
-  _ui.gap         = scY(12);
-  _ui.topH        = scY(38);
-  _ui.pillH       = scY(38);
-  _ui.pillR       = scR(19);
-  _ui.cardR       = scR(18);
-  _ui.headerPillW = (int)lroundf(_ui.W * 0.50f);
-  _ui.actionPillW = scX(160);
-  _ui.footerPillW = scX(160);
-
-  // Safety clamps
-  if (_ui.pad < 8) _ui.pad = 8;
-  if (_ui.gap < 6) _ui.gap = 6;
-  if (_ui.pillH < 22) _ui.pillH = 22;
-  if (_ui.pillR < 10) _ui.pillR = 10;
-  if (_ui.cardR < 10) _ui.cardR = 10;
-}
-
-int DisplayUI::bottomBarTop() const {
-  return _ui.H - _ui.pad - _ui.pillH;
-}
-
-void DisplayUI::textCenter(int x, int y, int w, int h, const char* txt, bool big, uint32_t col) {
-  _gfx->setTextColor(col);
-  _gfx->setTextDatum(textdatum_t::middle_center);
-  _gfx->setTextSize(big ? 2 : 1);
-  _gfx->drawString(txt, x + w/2, y + h/2);
-}
-
-void DisplayUI::drawPill(int x, int y, int w, int h, const char* label, bool active, bool bigText, bool disabled) {
-  uint32_t fill;
-  uint32_t txt;
-  if (disabled) {
-    fill = C_DISABLED(_lcd);
-    txt  = C_DIM(_lcd);
-  } else {
-    fill = active ? C_ACCENT(_lcd) : C_PILL(_lcd);
-    txt  = C_TEXT(_lcd);
-  }
-  _gfx->fillRoundRect(x, y, w, h, _ui.pillR, fill);
-  textCenter(x, y, w, h, label, bigText, txt);
-}
-
-bool DisplayUI::focusIsMarker(const UiState& s, int* outIndex) const {
-  // MARKER0..MARKER7 contiguous
-  const int f = (int)s.mainFocus;
-  const int base = (int)MainFocus::MARKER0;
-  const int last = (int)MainFocus::MARKER7;
-  if (f >= base && f <= last) {
-    const int idx = f - base;
-    if (outIndex) *outIndex = idx;
-    return idx >= 0 && idx < s.markerCount;
-  }
-  return false;
-}
-
-const char* DisplayUI::headerTitle(const UiState& s) {
-  switch (s.screen) {
-    case UiScreen::MAIN:     return s.modeName ? s.modeName : "Mode";
-    case UiScreen::SETTINGS: return "Settings";
-    case UiScreen::SET_POS:  return "Set Position";
-    case UiScreen::WIZARD:   return "Timeline Wizard";
-    case UiScreen::RUN:      return "Running";
-    case UiScreen::POPUP:    return "Running";
-    default:                 return "SlidePilot";
-  }
-}
-
-const char* DisplayUI::topRightLabel(const UiState& s) {
-  switch (s.screen) {
-    case UiScreen::MAIN:     return "Settings";
-    case UiScreen::SETTINGS: return "Back";
-    case UiScreen::SET_POS:  return "Back";
-    case UiScreen::WIZARD:   return "Back";
-    case UiScreen::RUN:      return "Cancel";
-    case UiScreen::POPUP:    return "Cancel";
-    default:                 return "";
-  }
-}
-
-void DisplayUI::drawTopBar(const UiState& s) {
-  const int x = _ui.pad;
-  const int y = _ui.pad;
-
-  drawPill(x, y, _ui.headerPillW, _ui.pillH, headerTitle(s), false, true);
-
-  const int rx = _ui.W - _ui.pad - _ui.actionPillW;
-
-  bool rightActive = false;
-  if (s.screen == UiScreen::MAIN) rightActive = (s.mainFocus == MainFocus::SETTINGS);
-
-  drawPill(rx, y, _ui.actionPillW, _ui.pillH, topRightLabel(s), rightActive, true);
-}
-
-void DisplayUI::drawFooterMain(const UiState& s) {
-  const int y = bottomBarTop();
-  const int leftX  = _ui.pad;
-  const int rightX = _ui.W - _ui.pad - _ui.footerPillW;
-
-  // SWAPPED: left=Next, right=Mode
-  const bool nextActive = (s.mainFocus == MainFocus::NEXT);
-  const bool modeActive = (s.mainFocus == MainFocus::MODE);
-
-  const bool nextDisabled = !s.allMarkersSet;
-
-  drawPill(leftX,  y, _ui.footerPillW, _ui.pillH, "Next", nextActive, true, nextDisabled);
-  drawPill(rightX, y, _ui.footerPillW, _ui.pillH, "Mode", modeActive, true, false);
-}
-
-void DisplayUI::drawFooterBackEnter(const UiState& s, const char* rightLabel) {
-  const int y = bottomBarTop();
-  const int leftX  = _ui.pad;
-  const int rightX = _ui.W - _ui.pad - _ui.footerPillW;
-
-  bool leftActive = false;
-  if (s.screen == UiScreen::SETTINGS) {
-    leftActive = (s.settingsFocus == SettingsFocus::BACK);
+  if (!_lcd) {
+    return;
   }
 
-  drawPill(leftX,  y, _ui.footerPillW, _ui.pillH, "Back", leftActive, true);
-  drawPill(rightX, y, _ui.footerPillW, _ui.pillH, rightLabel ? rightLabel : "", false, true);
+  // Create sprite after the panel is initialized.
+  _spr.setColorDepth(16);
+  _spr.setFont(&fonts::Font2);
+  _spr.setPsram(true);
+  _spr.createSprite(_lcd->width(), _lcd->height());
 }
 
-void DisplayUI::drawMain(const UiState& s) {
-  const int cardY = _ui.pad + _ui.topH + _ui.gap;
-  const int cardH = (bottomBarTop() - _ui.gap) - cardY;
-  const int cardX = _ui.pad;
-  const int cardW = _ui.W - _ui.pad*2;
-
-  // Highlight center squircle when focus is on timeline markers
-  int selectedMarkerIdx = -1;
-  const bool markerFocused = focusIsMarker(s, &selectedMarkerIdx);
-
-  _gfx->fillRoundRect(cardX, cardY, cardW, cardH, _ui.cardR, C_SURF(_lcd));
-  if (markerFocused) {
-    _gfx->drawRoundRect(cardX, cardY, cardW, cardH, _ui.cardR, C_ACCENT(_lcd));
-    _gfx->drawRoundRect(cardX+1, cardY+1, cardW-2, cardH-2, _ui.cardR, C_ACCENT(_lcd));
+void DisplayUI::draw(const UiState& state) {
+  if (!_lcd) {
+    return;
   }
 
-  // Timeline baseline
-  const int innerX = cardX + 18;
-  const int innerW = cardW - 36;
-
-  const int railY = cardY + (int)lroundf(cardH * 0.68f);
-  const int railX1 = innerX;
-  const int railX2 = innerX + innerW;
-
-  _gfx->drawFastHLine(railX1, railY, railX2 - railX1, C_DIM(_lcd));
-
-  // Place markers evenly left->right
-  auto markerX = [&](int idx)->int {
-    if (s.markerCount <= 1) return (railX1 + railX2)/2;
-    const float t = (float)idx / (float)(s.markerCount - 1);
-    return railX1 + (int)lroundf((railX2 - railX1) * t);
-  };
-
-  const int iconR = 14;
-
-  // Draw markers with icon states
-  for (int i = 0; i < s.markerCount; i++) {
-    const int mx = markerX(i);
-    const bool isSel = markerFocused && (i == selectedMarkerIdx);
-
-    const MarkerIconKind k = markerIconFromState(s.markers[i]);
-    drawMarkerIcon(_gfx, mx, railY, iconR, k, isSel,
-                   C_PILL(_lcd), C_TEXT(_lcd), C_ACCENT(_lcd), C_DIM(_lcd));
+  // Recreate sprite if rotation/size changed.
+  if (_spr.width() != _lcd->width() || _spr.height() != _lcd->height()) {
+    _spr.deleteSprite();
+    _spr.setColorDepth(16);
+    _spr.setPsram(true);
+    _spr.createSprite(_lcd->width(), _lcd->height());
   }
 
-  // Camera + arrow ONLY when user is selecting timeline points
-  if (markerFocused && selectedMarkerIdx >= 0) {
-    const int selX = markerX(selectedMarkerIdx);
+  const Metrics m = computeMetrics(_lcd);
 
-    // Padding stack: padding > camera > padding > arrow > padding > marker/timeline
-    const int camW = 34;
-    const int camH = 22;
+  _spr.fillScreen(C_BG);
 
-    const int camY = railY - (iconR + 16 + camH); // sits above arrow with padding
-    drawCameraIcon(_gfx, selX, camY, camW, camH, C_TEXT(_lcd), C_PILL(_lcd));
+  drawHeader(_spr, m, state);
+  drawContentFrame(_spr, m);
 
-    const int arrowTop = camY + camH/2 + 10;
-    const int arrowBottom = railY - iconR - 6;
-    drawDownArrow(_gfx, selX, arrowTop, arrowBottom, C_DIM(_lcd));
-  }
-
-  // IMPORTANT: remove debug text inside main squircle (per your request)
-}
-
-void DisplayUI::drawSettings(const UiState& s) {
-  const int cardY = _ui.pad + _ui.topH + _ui.gap;
-  const int cardH = (bottomBarTop() - _ui.gap) - cardY;
-  _gfx->fillRoundRect(_ui.pad, cardY, _ui.W - _ui.pad*2, cardH, _ui.cardR, C_SURF(_lcd));
-
-  const int x = _ui.pad + 14;
-  int y = cardY + 16;
-  const int rowW = _ui.W - (_ui.pad + 14)*2;
-
-  auto row = [&](const char* label, const char* value, bool active) {
-    _gfx->fillRoundRect(x, y, rowW, 26, 10, active ? C_ACCENT(_lcd) : C_PILL(_lcd));
-    _gfx->setTextDatum(textdatum_t::middle_left);
-    _gfx->setTextSize(1);
-    _gfx->setTextColor(C_TEXT(_lcd));
-    _gfx->drawString(label, x + 10, y + 13);
-    _gfx->setTextDatum(textdatum_t::middle_right);
-    _gfx->drawString(value, x + rowW - 10, y + 13);
-    y += 34;
-  };
-
-  row("Testing Mode", s.settings.testingMode ? "ON" : "OFF",
-      s.settingsFocus == SettingsFocus::TESTING_MODE);
-
-  row("Invert Direction", s.settings.invertDir ? "ON" : "OFF",
-      s.settingsFocus == SettingsFocus::INVERT_DIR);
-
-  drawFooterBackEnter(s, "");
-}
-
-void DisplayUI::drawSetPos(const UiState& s) {
-  const int cardY = _ui.pad + _ui.topH + _ui.gap;
-  const int cardH = (bottomBarTop() - _ui.gap) - cardY;
-  _gfx->fillRoundRect(_ui.pad, cardY, _ui.W - _ui.pad*2, cardH, _ui.cardR, C_SURF(_lcd));
-
-  _gfx->setTextDatum(textdatum_t::top_left);
-  _gfx->setTextSize(2);
-  _gfx->setTextColor(C_TEXT(_lcd));
-  _gfx->setCursor(_ui.pad + 16, cardY + 18);
-  _gfx->print("Set Position");
-
-  drawFooterBackEnter(s, "Save");
-}
-
-void DisplayUI::drawWizard(const UiState& s) {
-  const int cardY = _ui.pad + _ui.topH + _ui.gap;
-  const int cardH = (bottomBarTop() - _ui.gap) - cardY;
-  _gfx->fillRoundRect(_ui.pad, cardY, _ui.W - _ui.pad*2, cardH, _ui.cardR, C_SURF(_lcd));
-
-  _gfx->setTextDatum(textdatum_t::top_left);
-  _gfx->setTextSize(2);
-  _gfx->setTextColor(C_TEXT(_lcd));
-  _gfx->setCursor(_ui.pad + 16, cardY + 18);
-  _gfx->print("Timeline Wizard");
-
-  drawFooterBackEnter(s, "Next");
-}
-
-void DisplayUI::drawRun(const UiState& s) {
-  const int cardY = _ui.pad + _ui.topH + _ui.gap;
-  const int cardH = (bottomBarTop() - _ui.gap) - cardY;
-  _gfx->fillRoundRect(_ui.pad, cardY, _ui.W - _ui.pad*2, cardH, _ui.cardR, C_SURF(_lcd));
-
-  _gfx->setTextDatum(textdatum_t::top_left);
-  _gfx->setTextSize(2);
-  _gfx->setTextColor(C_TEXT(_lcd));
-  _gfx->setCursor(_ui.pad + 16, cardY + 18);
-  _gfx->print("Running");
-
-  _gfx->setTextSize(1);
-  _gfx->setCursor(_ui.pad + 16, cardY + 52);
-  _gfx->print("Motor DISABLED.");
-}
-
-void DisplayUI::drawPopup(const UiState& s) {
-  const int w = _ui.W - _ui.pad*4;
-  const int h = 96;
-  const int x = _ui.pad*2;
-  const int y = (_ui.H - h) / 2;
-
-  _gfx->fillRoundRect(x, y, w, h, 16, C_SURF(_lcd));
-  _gfx->setTextDatum(textdatum_t::top_left);
-  _gfx->setTextSize(1);
-  _gfx->setTextColor(C_TEXT(_lcd));
-  _gfx->setCursor(x + 14, y + 14);
-
-  if (s.popup == PopupKind::NEED_ALL_MARKERS) {
-    _gfx->print("Set all markers first.");
-  } else {
-    _gfx->print("Cancel the run?");
-  }
-
-  const int by = y + 50;
-  const int bw = (w - 12) / 2;
-  const int bh = 32;
-
-  const bool yesActive = s.popupYesSelected;
-  const bool noActive  = !s.popupYesSelected;
-
-  drawPill(x + 0,       by, bw, bh, "No",  noActive, true);
-  drawPill(x + bw + 12, by, bw, bh, "Yes", yesActive, true);
-}
-
-void DisplayUI::render(const UiState& s) {
-  _gfx = _lcd;
-
-  _gfx->fillScreen(C_BG(_lcd));
-  drawTopBar(s);
-
-  switch (s.screen) {
+  switch (state.screen) {
     case UiScreen::MAIN:
-      drawMain(s);
-      drawFooterMain(s);
+      drawMainScreen(_spr, m, state);
       break;
     case UiScreen::SETTINGS:
-      drawSettings(s);
+      drawSettingsScreen(_spr, m, state);
       break;
-    case UiScreen::SET_POS:
-      drawSetPos(s);
-      break;
-    case UiScreen::WIZARD:
-      drawWizard(s);
-      break;
-    case UiScreen::RUN:
-      drawRun(s);
-      break;
-    case UiScreen::POPUP:
-      drawRun(s);
-      drawPopup(s);
+    case UiScreen::RUNNING:
+      drawRunningScreen(_spr, m, state);
       break;
     default:
+      // fallback
+      _spr.setTextDatum(middle_center);
+      _spr.setTextSize(2);
+      _spr.setTextColor(C_TEXT);
+      _spr.drawString("(unimplemented)", m.W / 2, m.H / 2);
       break;
   }
+
+  drawBottomPills(_spr, m, state);
+
+  _spr.pushSprite(0, 0);
 }
